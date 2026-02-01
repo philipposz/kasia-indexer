@@ -502,6 +502,7 @@ impl DataSource {
                                 Serializable(GetVirtualChainFromBlockRequest::new(
                                     RpcHash::from_bytes(vc_from),
                                     true,
+                                    None,
                                 )),
                             )
                             .await

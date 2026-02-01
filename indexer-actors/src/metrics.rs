@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "serde")]
 use serde::Serialize;
 #[cfg(feature = "utoipa")]
-use utoipa::{ToSchema, schema};
+use utoipa::ToSchema;
 
 /// A snapshot of the indexer metrics.
 /// This structure contains a copy of all metric counters as simple u64 values.

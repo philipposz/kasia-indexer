@@ -44,6 +44,7 @@ use workflow_core::channel::Channel;
 mod api;
 mod config;
 mod context;
+mod push;
 mod signals;
 
 #[tokio::main]
@@ -230,6 +231,9 @@ async fn main() -> anyhow::Result<()> {
     let data_source_handle = tokio::spawn(async move { data_source.task().await });
     let ticker_handle = tokio::spawn(async move { ticker.process().await });
 
+    let push_service = push::PushService::from_context(&context).await?;
+    let push_api = api::v1::push::PushApi::new(push_service);
+
     let api_service = api::v1::Api::new(
         tx_keyspace.clone(),
         handshake_by_sender_partition,
@@ -243,6 +247,7 @@ async fn main() -> anyhow::Result<()> {
         tx_id_to_payment_partition,
         self_stash_by_owner_partition,
         tx_id_to_self_stash_partition,
+        push_api,
         metrics.clone(),
         context.clone(),
     );

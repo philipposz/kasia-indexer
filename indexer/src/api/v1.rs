@@ -1,6 +1,7 @@
 use crate::api::v1::contextual_messages::ContextualMessageApi;
 use crate::api::v1::handshakes::HandshakeApi;
 use crate::api::v1::payments::PaymentApi;
+use crate::api::v1::push::PushApi;
 use crate::api::v1::self_stash::SelfStashApi;
 use crate::context::IndexerContext;
 use axum::extract::State;
@@ -27,6 +28,7 @@ use utoipa_swagger_ui::SwaggerUi;
 pub mod contextual_messages;
 pub mod handshakes;
 pub mod payments;
+pub mod push;
 pub mod self_stash;
 
 #[derive(OpenApi)]
@@ -37,11 +39,15 @@ pub mod self_stash;
         contextual_messages::get_contextual_messages_by_sender,
         payments::get_payments_by_sender,
         payments::get_payments_by_receiver,
+        push::create_challenge,
+        push::register_device,
+        push::update_device,
+        push::unregister_device,
         self_stash::get_self_stash_by_owner,
         get_metrics,
     ),
     components(
-        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, self_stash::SelfStashResponse, IndexerMetricsSnapshot)
+        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, IndexerMetricsSnapshot)
     ),
     tags(
         (name = "Kasia Indexer API", description = "Kasia Indexer API")
@@ -54,6 +60,7 @@ pub struct Api {
     handshake_api: HandshakeApi,
     contextual_message_api: ContextualMessageApi,
     payment_api: PaymentApi,
+    push_api: PushApi,
     self_stash_api: SelfStashApi,
     metrics: SharedMetrics,
 }
@@ -73,6 +80,7 @@ impl Api {
         tx_id_to_payment_partition: TxIdToPaymentPartition,
         self_stash_by_owner_partition: SelfStashByOwnerPartition,
         tx_id_to_self_stash_partition: TxIdToSelfStashPartition,
+        push_api: PushApi,
         metrics: SharedMetrics,
         context: IndexerContext,
     ) -> Self {
@@ -114,6 +122,7 @@ impl Api {
             handshake_api,
             contextual_message_api,
             payment_api,
+            push_api,
             self_stash_api,
             metrics,
         }
@@ -155,6 +164,7 @@ impl Api {
                 "/self-stash",
                 SelfStashApi::router().with_state(self.self_stash_api.clone()),
             )
+            .nest("/v1/push", PushApi::router().with_state(self.push_api.clone()))
             .route(
                 "/metrics",
                 get(get_metrics).with_state(self.metrics.clone()),

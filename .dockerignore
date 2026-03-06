@@ -1,3 +1,6 @@
 target/
 Dockerfile
 .gitignore
+.env
+.env.*
+secrets/

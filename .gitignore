@@ -2,6 +2,7 @@
 /rpc.txt
 /.idea
 .env
+/secrets
 /dump
 
 cli

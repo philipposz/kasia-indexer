@@ -40,8 +40,50 @@ The indexer consists of several key components:
 Useful commands:
 
 - run locally: `RUST_LOG=info cargo run -r -p indexer`
-- build docker image `docker build -t kkluster/kasia-indexer .`
+- build docker image `docker build -t kkluster/kasia-indexer:ios-first .`
 - run as docker-compose: `docker compose up -d`
+
+## Docker deployment (iOS-first)
+
+The default `docker-compose.yaml` is configured for an iOS-first push profile:
+
+- APNs as primary provider (`PUSH_PROVIDER=apns`)
+- FCM disabled by default (`PUSH_FCM_ENABLED=false`)
+- APNs `.p8` key mounted from host into container at `/app/secrets/apns/AuthKey.p8`
+
+### 1) Prepare env file
+
+```bash
+cp .env.example .env
+```
+
+Set at minimum:
+
+- `KASPA_NODE_WBORSH_URL`
+- `PUSH_APNS_TEAM_ID`
+- `PUSH_APNS_KEY_ID`
+- `PUSH_APNS_BUNDLE_ID` (for KaChat/KBeam typically `com.kbeam.app`)
+
+### 2) Place APNs key on host
+
+```bash
+mkdir -p secrets/apns
+cp /path/to/AuthKey_XXXXXX.p8 secrets/apns/AuthKey.p8
+chmod 600 secrets/apns/AuthKey.p8
+```
+
+### 3) Start service
+
+```bash
+docker compose up -d --build
+```
+
+### 4) Check health/logs
+
+```bash
+docker compose ps
+docker compose logs -f kasia-indexer
+```
 
 ## API
 
@@ -61,4 +103,16 @@ NETWORK_TYPE=mainnet
 
 # if not defined, fallback to public kaspa network, if specified, the `ws://{ip}:{port}` node url
 #KASPA_NODE_WBORSH_URL=
+
+# iOS-first push profile
+PUSH_PROVIDER=apns
+PUSH_IOS_ENABLED=true
+PUSH_FCM_ENABLED=false
+
+# APNs auth
+PUSH_APNS_ENVIRONMENT=auto
+PUSH_APNS_TEAM_ID=
+PUSH_APNS_KEY_ID=
+PUSH_APNS_BUNDLE_ID=com.kbeam.app
+PUSH_APNS_KEY_PATH=/app/secrets/apns/AuthKey.p8
 ```

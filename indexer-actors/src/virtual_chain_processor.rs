@@ -1,6 +1,7 @@
 pub mod message;
 
 use crate::data_source::{Command, Request};
+use crate::metrics::SharedMetrics;
 use crate::util::ToHex64;
 use crate::virtual_chain_syncer::{NotificationAck, VirtualChainSyncer};
 use fjall::{TxKeyspace, WriteTransaction};
@@ -60,6 +61,7 @@ pub struct VirtualProcessor {
     payment_by_receiver_partition: PaymentByReceiverPartition,
     payment_by_sender_partition: PaymentBySenderPartition,
 
+    metrics: SharedMetrics,
     runtime: tokio::runtime::Handle,
 }
 
@@ -850,6 +852,7 @@ impl VirtualProcessor {
             )?;
 
             if wtx.commit()?.is_ok() {
+                self.metrics.increment_resolved_senders(1);
                 return Ok(());
             } else {
                 warn!("Conflict detected, retry handling sender update")

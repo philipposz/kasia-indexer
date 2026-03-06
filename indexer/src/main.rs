@@ -174,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
         .payment_by_receiver_partition(payment_by_receiver_partition.clone())
         .payment_by_sender_partition(payment_by_sender_partition.clone())
         .self_stash_by_owner_partition(self_stash_by_owner_partition.clone())
+        .metrics(metrics.clone())
         .runtime(tokio::runtime::Handle::current())
         .build();
 
@@ -200,6 +201,7 @@ async fn main() -> anyhow::Result<()> {
         .payment_by_sender_partition(payment_by_sender_partition.clone())
         .handshake_by_sender_partition(handshake_by_sender_partition.clone())
         .contextual_message_by_sender_partition(contextual_message_partition.clone())
+        .pending_sender_resolution_partition(pending_sender_resolution_partition.clone())
         .build();
 
     let mut data_source = DataSource::new(

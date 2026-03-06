@@ -33,6 +33,10 @@ pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_
                 sealed_hex @ ..,
             ],
         ) => Some(SealedOperation::PaymentV1(SealedPaymentV1 { sealed_hex })),
+        // Legacy payloads used "pay:" instead of "payment:".
+        Some([b'p', b'a', b'y', b':', sealed_hex @ ..]) => {
+            Some(SealedOperation::PaymentV1(SealedPaymentV1 { sealed_hex }))
+        }
         Some(
             [
                 b'h',

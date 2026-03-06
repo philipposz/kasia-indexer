@@ -225,6 +225,14 @@ impl IndexerMetrics {
     pub fn set_contextual_messages(&self, count: u64) {
         self.contextual_messages.store(count, Ordering::Relaxed);
     }
+
+    pub fn set_unknown_sender_entries(&self, count: u64) {
+        self.unknown_sender_entries.store(count, Ordering::Relaxed);
+    }
+
+    pub fn increment_resolved_senders(&self, count: u64) {
+        self.resolved_sender.fetch_add(count, Ordering::Relaxed);
+    }
 }
 
 impl Default for IndexerMetrics {

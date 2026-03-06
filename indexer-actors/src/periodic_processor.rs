@@ -8,6 +8,7 @@ use indexer_db::messages::handshake::{HandshakeBySenderPartition, TxIdToHandshak
 use indexer_db::messages::payment::{PaymentBySenderPartition, TxIdToPaymentPartition};
 use indexer_db::metadata::MetadataPartition;
 use indexer_db::processing::accepting_block_to_txs::AcceptingBlockToTxIDPartition;
+use indexer_db::processing::pending_senders::PendingSenderResolutionPartition;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, info, trace};
@@ -41,6 +42,7 @@ pub struct PeriodicProcessor {
     payment_by_sender_partition: PaymentBySenderPartition,
     contextual_message_by_sender_partition: ContextualMessageBySenderPartition,
     handshake_by_sender_partition: HandshakeBySenderPartition,
+    pending_sender_resolution_partition: PendingSenderResolutionPartition,
 }
 
 impl PeriodicProcessor {
@@ -131,6 +133,9 @@ impl PeriodicProcessor {
         self.metrics.set_contextual_messages(
             self.contextual_message_by_sender_partition
                 .approximate_len() as u64,
+        );
+        self.metrics.set_unknown_sender_entries(
+            self.pending_sender_resolution_partition.len()? as u64,
         );
         self.metrics.set_latest_block(
             self.metadata_partition

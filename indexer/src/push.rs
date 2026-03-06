@@ -492,7 +492,7 @@ fn is_hex_string(value: &str) -> bool {
 }
 
 async fn load_registrations(path: &Path) -> anyhow::Result<HashMap<String, DeviceRegistration>> {
-    let data = match tokio::fs::read(path).await {
+    let data = match std::fs::read(path) {
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
         Err(error) => {
@@ -521,12 +521,10 @@ async fn persist_registrations(path: &Path, values: Vec<DeviceRegistration>) -> 
         .context("failed to serialize push registrations")?;
 
     if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
+        std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create push registration directory {}", parent.display()))?;
     }
 
-    tokio::fs::write(path, encoded)
-        .await
+    std::fs::write(path, encoded)
         .with_context(|| format!("failed to write push registrations to {}", path.display()))
 }

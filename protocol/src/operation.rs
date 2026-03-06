@@ -142,6 +142,18 @@ mod tests {
     }
 
     #[test]
+    fn test_deserialize_sealed_payment_legacy_pay_prefix() {
+        let payload = b"ciph_msg:1:pay:abc123";
+        let result = parse_sealed_operation(payload);
+        assert_eq!(
+            result,
+            Some(SealedOperation::PaymentV1(SealedPaymentV1 {
+                sealed_hex: b"abc123",
+            }))
+        );
+    }
+
+    #[test]
     fn test_deserialize_sealed_contextual_message() {
         let payload = b"ciph_msg:1:comm:alias123:abc123";
         let result = parse_sealed_operation(payload);

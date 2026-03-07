@@ -33,6 +33,8 @@ utoipa-swagger-ui = { workspace = true, features = ["axum"] }
 workflow-core = { workspace = true }
 itertools = { workspace = true }
 uuid = { workspace = true }
+reqwest = { workspace = true }
+jsonwebtoken = { workspace = true }
 
 indexer-db = { path = "../indexer-db" }
 indexer-actors = { path = "../indexer-actors", features = ["serde", "utoipa"] }

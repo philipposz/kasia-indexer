@@ -1,21 +1,29 @@
+use crate::api::to_rpc_address;
 use crate::context::IndexerContext;
 use anyhow::Context;
 use axum::http::StatusCode;
+use indexer_actors::block_processor::{PushDispatchEvent, PushMessageType};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use kaspa_rpc_core::RpcNetworkType;
+use reqwest::StatusCode as HttpStatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::info;
+use tokio::sync::{Mutex, RwLock};
+use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct PushService {
     config: PushConfig,
+    network: RpcNetworkType,
     registrations_path: PathBuf,
     registrations: Arc<RwLock<HashMap<String, DeviceRegistration>>>,
     challenges: Arc<RwLock<HashMap<String, ChallengeEntry>>>,
+    apns_client: Option<Arc<ApnsClient>>,
 }
 
 #[derive(Clone, Debug)]
@@ -25,6 +33,13 @@ pub struct PushConfig {
     pub push_fcm_enabled: bool,
     pub challenge_ttl_ms: u64,
     pub challenge_skew_ms: u64,
+    pub apns_environment: String,
+    pub apns_team_id: Option<String>,
+    pub apns_key_id: Option<String>,
+    pub apns_bundle_id: Option<String>,
+    pub apns_key_path: Option<PathBuf>,
+    pub apns_inline_payload_limit: usize,
+    pub apns_timeout_ms: u64,
 }
 
 impl PushConfig {
@@ -35,6 +50,16 @@ impl PushConfig {
             push_fcm_enabled: read_env_bool("PUSH_FCM_ENABLED", false),
             challenge_ttl_ms: read_env_u64("PUSH_CHALLENGE_TTL_MS", 120_000),
             challenge_skew_ms: read_env_u64("PUSH_CHALLENGE_SKEW_MS", 15_000),
+            apns_environment: read_env_string("PUSH_APNS_ENVIRONMENT")
+                .unwrap_or_else(|| "auto".to_string())
+                .trim()
+                .to_lowercase(),
+            apns_team_id: read_env_string("PUSH_APNS_TEAM_ID"),
+            apns_key_id: read_env_string("PUSH_APNS_KEY_ID"),
+            apns_bundle_id: read_env_string("PUSH_APNS_BUNDLE_ID"),
+            apns_key_path: read_env_string("PUSH_APNS_KEY_PATH").map(PathBuf::from),
+            apns_inline_payload_limit: read_env_usize("PUSH_INLINE_PAYLOAD_LIMIT", 3500),
+            apns_timeout_ms: read_env_u64("PUSH_APNS_TIMEOUT_MS", 15_000),
         }
     }
 }
@@ -181,6 +206,13 @@ impl PushService {
             .map(PathBuf::from)
             .unwrap_or_else(|| context.db_path.join("push-registrations.json"));
         let registrations = load_registrations(&registrations_path).await?;
+        let network = context.network_type.into();
+        let apns_client = ApnsClient::from_config(&config, network)
+            .inspect_err(
+                |error| warn!(%error, "Failed to initialize APNs client, push dispatch disabled"),
+            )
+            .ok()
+            .map(Arc::new);
 
         info!(
             "Push service initialized provider={} ios_enabled={} fcm_enabled={} registrations={}",
@@ -192,10 +224,177 @@ impl PushService {
 
         Ok(Self {
             config,
+            network,
             registrations_path,
             registrations: Arc::new(RwLock::new(registrations)),
             challenges: Arc::new(RwLock::new(HashMap::new())),
+            apns_client,
         })
+    }
+
+    pub async fn run_dispatch_worker(self, event_rx: flume::Receiver<PushDispatchEvent>) {
+        info!("Push dispatch worker started");
+
+        while let Ok(event) = event_rx.recv_async().await {
+            if let Err(error) = self.dispatch_event(event).await {
+                warn!(%error, "Push dispatch failed");
+            }
+        }
+
+        info!("Push dispatch worker stopped");
+    }
+
+    async fn dispatch_event(&self, event: PushDispatchEvent) -> anyhow::Result<()> {
+        let Some(apns_client) = &self.apns_client else {
+            return Ok(());
+        };
+
+        let Some(sender) = event.sender else {
+            return Ok(());
+        };
+
+        let Some(sender_address) = self.address_payload_to_string(&sender)? else {
+            return Ok(());
+        };
+        let receiver_address = self.address_payload_to_string(&event.receiver)?;
+
+        let targets = self
+            .matching_registrations(
+                event.message_type,
+                &sender_address,
+                receiver_address.as_deref(),
+            )
+            .await;
+
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        let tx_id = faster_hex::hex_string(&event.tx_id);
+        let payload_hex = event
+            .payload
+            .as_ref()
+            .map(|payload| faster_hex::hex_string(payload))
+            .filter(|payload| payload.len() <= self.config.apns_inline_payload_limit);
+
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "aps".to_string(),
+            json!({
+                "alert": {
+                    "title": "KaChat",
+                    "body": match event.message_type {
+                        PushMessageType::Payment => "Received payment",
+                        PushMessageType::Handshake => "Started a conversation",
+                        PushMessageType::Contextual => "New message",
+                    }
+                },
+                "mutable-content": 1,
+                "content-available": 1
+            }),
+        );
+        body.insert("tx_id".to_string(), json!(tx_id));
+        body.insert("sender".to_string(), json!(sender_address));
+        body.insert(
+            "type".to_string(),
+            json!(match event.message_type {
+                PushMessageType::Handshake => "handshake",
+                PushMessageType::Payment => "payment",
+                PushMessageType::Contextual => "contextual",
+            }),
+        );
+        body.insert("timestamp".to_string(), json!(event.timestamp));
+        if let Some(amount) = event.amount {
+            body.insert("amount".to_string(), json!(amount));
+        }
+        if let Some(payload) = payload_hex {
+            body.insert("payload".to_string(), json!(payload));
+        }
+        let payload = Value::Object(body);
+
+        let mut stale_tokens = Vec::new();
+        for registration in targets {
+            match apns_client
+                .send_notification(&registration.device_token, &payload)
+                .await
+            {
+                Ok(ApnsSendOutcome::Sent) => {
+                    debug!(
+                        token = %registration.device_token,
+                        tx_id = %tx_id,
+                        "Push notification sent"
+                    );
+                }
+                Ok(ApnsSendOutcome::InvalidToken) => {
+                    warn!(token = %registration.device_token, "APNs token is invalid, pruning registration");
+                    stale_tokens.push(registration.device_token);
+                }
+                Err(error) => {
+                    warn!(
+                        %error,
+                        token = %registration.device_token,
+                        tx_id = %tx_id,
+                        "APNs delivery failed"
+                    );
+                }
+            }
+        }
+
+        if !stale_tokens.is_empty() {
+            self.remove_stale_registrations(stale_tokens).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn matching_registrations(
+        &self,
+        message_type: PushMessageType,
+        sender_address: &str,
+        receiver_address: Option<&str>,
+    ) -> Vec<DeviceRegistration> {
+        let registrations = self.registrations.read().await;
+
+        registrations
+            .values()
+            .filter(|registration| registration.token_type == "apns")
+            .filter(|registration| match message_type {
+                PushMessageType::Contextual => {
+                    registration.watched_addresses.contains(sender_address)
+                }
+                PushMessageType::Handshake | PushMessageType::Payment => {
+                    let Some(receiver) = receiver_address else {
+                        return false;
+                    };
+                    registration
+                        .primary_address
+                        .as_deref()
+                        .is_some_and(|value| value == receiver)
+                        || registration.wallet_address == receiver
+                        || registration.watched_addresses.contains(receiver)
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn address_payload_to_string(
+        &self,
+        payload: &indexer_db::AddressPayload,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(
+            to_rpc_address(payload, self.network)?
+                .map(|address| address.to_string().to_lowercase()),
+        )
+    }
+
+    async fn remove_stale_registrations(&self, stale_tokens: Vec<String>) -> anyhow::Result<()> {
+        let stale_tokens: HashSet<String> = stale_tokens.into_iter().collect();
+        let mut registrations = self.registrations.write().await;
+        registrations.retain(|token, _| !stale_tokens.contains(token));
+        let snapshot = registrations.values().cloned().collect::<Vec<_>>();
+        drop(registrations);
+        persist_registrations(&self.registrations_path, snapshot).await
     }
 
     pub async fn create_challenge(&self) -> PushChallengeResponse {
@@ -207,7 +406,9 @@ impl PushService {
         };
 
         let mut challenges = self.challenges.write().await;
-        challenges.retain(|_, entry| entry.expires_at_ms >= now.saturating_sub(self.config.challenge_skew_ms));
+        challenges.retain(|_, entry| {
+            entry.expires_at_ms >= now.saturating_sub(self.config.challenge_skew_ms)
+        });
         challenges.insert(
             challenge.nonce.clone(),
             ChallengeEntry {
@@ -264,7 +465,9 @@ impl PushService {
         drop(registrations);
         persist_registrations(&self.registrations_path, snapshot)
             .await
-            .map_err(|error| PushApiError::internal(format!("failed to persist registrations: {error}")))
+            .map_err(|error| {
+                PushApiError::internal(format!("failed to persist registrations: {error}"))
+            })
     }
 
     pub async fn update(&self, request: PushUpdateRequest) -> Result<(), PushApiError> {
@@ -300,7 +503,9 @@ impl PushService {
         drop(registrations);
         persist_registrations(&self.registrations_path, snapshot)
             .await
-            .map_err(|error| PushApiError::internal(format!("failed to persist registrations: {error}")))
+            .map_err(|error| {
+                PushApiError::internal(format!("failed to persist registrations: {error}"))
+            })
     }
 
     pub async fn unregister(&self, request: PushUnregisterRequest) -> Result<(), PushApiError> {
@@ -325,7 +530,9 @@ impl PushService {
         drop(registrations);
         persist_registrations(&self.registrations_path, snapshot)
             .await
-            .map_err(|error| PushApiError::internal(format!("failed to persist registrations: {error}")))
+            .map_err(|error| {
+                PushApiError::internal(format!("failed to persist registrations: {error}"))
+            })
     }
 
     fn validate_token_and_type(&self, token: &str, token_type: &str) -> Result<(), PushApiError> {
@@ -346,7 +553,10 @@ impl PushService {
         Err(PushApiError::bad_request("unsupported token type"))
     }
 
-    async fn validate_auth(&self, auth: Option<&PushAuthRequest>) -> Result<ValidatedAuth, PushApiError> {
+    async fn validate_auth(
+        &self,
+        auth: Option<&PushAuthRequest>,
+    ) -> Result<ValidatedAuth, PushApiError> {
         let auth = auth.ok_or_else(|| PushApiError::unauthorized("missing auth"))?;
 
         let wallet_pubkey = auth.wallet_pubkey.trim().to_lowercase();
@@ -365,7 +575,9 @@ impl PushService {
         let skew = self.config.challenge_skew_ms;
 
         if now.saturating_add(skew) < auth.timestamp_ms {
-            return Err(PushApiError::unauthorized("auth timestamp is in the future"));
+            return Err(PushApiError::unauthorized(
+                "auth timestamp is in the future",
+            ));
         }
         if now > auth.expires_at_ms.saturating_add(skew) {
             return Err(PushApiError::unauthorized("auth expired"));
@@ -390,7 +602,9 @@ impl PushService {
         if auth.timestamp_ms < challenge.issued_at_ms.saturating_sub(skew)
             || auth.timestamp_ms > challenge.expires_at_ms.saturating_add(skew)
         {
-            return Err(PushApiError::unauthorized("auth timestamp outside challenge window"));
+            return Err(PushApiError::unauthorized(
+                "auth timestamp outside challenge window",
+            ));
         }
 
         Ok(ValidatedAuth {
@@ -398,6 +612,187 @@ impl PushService {
             wallet_address,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApnsSendOutcome {
+    Sent,
+    InvalidToken,
+}
+
+#[derive(Clone)]
+struct ApnsClient {
+    client: reqwest::Client,
+    host: String,
+    topic: String,
+    team_id: String,
+    key_id: String,
+    encoding_key: EncodingKey,
+    token_cache: Arc<Mutex<Option<ApnsBearerToken>>>,
+}
+
+#[derive(Clone)]
+struct ApnsBearerToken {
+    token: String,
+    issued_at_secs: u64,
+}
+
+#[derive(Serialize)]
+struct ApnsClaims<'a> {
+    iss: &'a str,
+    iat: usize,
+}
+
+#[derive(Deserialize)]
+struct ApnsErrorBody {
+    reason: Option<String>,
+}
+
+impl ApnsClient {
+    fn from_config(config: &PushConfig, network: RpcNetworkType) -> anyhow::Result<Self> {
+        if config.push_provider != "apns" || !config.push_ios_enabled {
+            anyhow::bail!("APNs push provider is disabled")
+        }
+
+        let team_id = config
+            .apns_team_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("PUSH_APNS_TEAM_ID is not set"))?;
+        let key_id = config
+            .apns_key_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("PUSH_APNS_KEY_ID is not set"))?;
+        let topic = config
+            .apns_bundle_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("PUSH_APNS_BUNDLE_ID is not set"))?;
+        let key_path = config
+            .apns_key_path
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("PUSH_APNS_KEY_PATH is not set"))?;
+
+        let key_bytes = std::fs::read(&key_path)
+            .with_context(|| format!("failed to read APNs key file {}", key_path.display()))?;
+        let encoding_key = EncodingKey::from_ec_pem(&key_bytes)
+            .context("failed to parse APNs private key (expected .p8 PEM)")?;
+
+        let host = match config.apns_environment.as_str() {
+            "sandbox" | "development" => "https://api.sandbox.push.apple.com".to_string(),
+            "production" | "prod" => "https://api.push.apple.com".to_string(),
+            "auto" => {
+                if matches!(network, RpcNetworkType::Mainnet) {
+                    "https://api.push.apple.com".to_string()
+                } else {
+                    "https://api.sandbox.push.apple.com".to_string()
+                }
+            }
+            value => anyhow::bail!("unsupported PUSH_APNS_ENVIRONMENT value: {value}"),
+        };
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(config.apns_timeout_ms))
+            .build()
+            .context("failed to build APNs HTTP client")?;
+
+        Ok(Self {
+            client,
+            host,
+            topic,
+            team_id,
+            key_id,
+            encoding_key,
+            token_cache: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    async fn send_notification(
+        &self,
+        device_token: &str,
+        payload: &Value,
+    ) -> anyhow::Result<ApnsSendOutcome> {
+        let auth_token = self.auth_token().await?;
+        let url = format!("{}/3/device/{}", self.host, device_token);
+
+        let response = self
+            .client
+            .post(url)
+            .header("authorization", format!("bearer {auth_token}"))
+            .header("apns-topic", &self.topic)
+            .header("apns-push-type", "alert")
+            .json(payload)
+            .send()
+            .await
+            .context("failed to send APNs notification")?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(ApnsSendOutcome::Sent);
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        let reason = extract_apns_reason(&body).unwrap_or_else(|| "unknown".to_string());
+
+        if status == HttpStatusCode::UNAUTHORIZED {
+            self.invalidate_auth_token().await;
+        }
+
+        if is_invalid_token_response(status, &reason) {
+            return Ok(ApnsSendOutcome::InvalidToken);
+        }
+
+        anyhow::bail!(
+            "APNs rejected notification: status={} reason={reason}",
+            status
+        )
+    }
+
+    async fn auth_token(&self) -> anyhow::Result<String> {
+        let now_secs = now_ms() / 1000;
+        {
+            let cached = self.token_cache.lock().await;
+            if let Some(cached) = cached.as_ref()
+                && now_secs.saturating_sub(cached.issued_at_secs) < 50 * 60
+            {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(self.key_id.clone());
+        let claims = ApnsClaims {
+            iss: &self.team_id,
+            iat: now_secs as usize,
+        };
+        let token = jsonwebtoken::encode(&header, &claims, &self.encoding_key)
+            .context("failed to sign APNs JWT")?;
+
+        let mut cache = self.token_cache.lock().await;
+        *cache = Some(ApnsBearerToken {
+            token: token.clone(),
+            issued_at_secs: now_secs,
+        });
+        Ok(token)
+    }
+
+    async fn invalidate_auth_token(&self) {
+        let mut cache = self.token_cache.lock().await;
+        *cache = None;
+    }
+}
+
+fn extract_apns_reason(body: &str) -> Option<String> {
+    serde_json::from_str::<ApnsErrorBody>(body)
+        .ok()
+        .and_then(|payload| payload.reason)
+}
+
+fn is_invalid_token_response(status: HttpStatusCode, reason: &str) -> bool {
+    matches!(
+        (status, reason),
+        (HttpStatusCode::BAD_REQUEST, "BadDeviceToken")
+            | (HttpStatusCode::BAD_REQUEST, "DeviceTokenNotForTopic")
+            | (HttpStatusCode::GONE, "Unregistered")
+    )
 }
 
 fn normalize_addresses(values: Vec<String>) -> HashSet<String> {
@@ -473,6 +868,13 @@ fn read_env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn read_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 fn read_env_string(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -502,8 +904,8 @@ async fn load_registrations(path: &Path) -> anyhow::Result<HashMap<String, Devic
         }
     };
 
-    let snapshot: RegistrySnapshot = serde_json::from_slice(&data)
-        .context("failed to parse push registrations file")?;
+    let snapshot: RegistrySnapshot =
+        serde_json::from_slice(&data).context("failed to parse push registrations file")?;
 
     Ok(snapshot
         .registrations
@@ -517,12 +919,16 @@ async fn persist_registrations(path: &Path, values: Vec<DeviceRegistration>) -> 
         registrations: values,
     };
 
-    let encoded = serde_json::to_vec_pretty(&snapshot)
-        .context("failed to serialize push registrations")?;
+    let encoded =
+        serde_json::to_vec_pretty(&snapshot).context("failed to serialize push registrations")?;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create push registration directory {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create push registration directory {}",
+                parent.display()
+            )
+        })?;
     }
 
     std::fs::write(path, encoded)

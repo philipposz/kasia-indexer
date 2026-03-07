@@ -115,4 +115,8 @@ PUSH_APNS_TEAM_ID=
 PUSH_APNS_KEY_ID=
 PUSH_APNS_BUNDLE_ID=com.kbeam.app
 PUSH_APNS_KEY_PATH=/app/secrets/apns/AuthKey.p8
+
+# Optional APNs dispatch tuning
+PUSH_INLINE_PAYLOAD_LIMIT=3500
+PUSH_APNS_TIMEOUT_MS=15000
 ```

@@ -164,7 +164,10 @@ impl Api {
                 "/self-stash",
                 SelfStashApi::router().with_state(self.self_stash_api.clone()),
             )
-            .nest("/v1/push", PushApi::router().with_state(self.push_api.clone()))
+            .nest(
+                "/v1/push",
+                PushApi::router().with_state(self.push_api.clone()),
+            )
             .route(
                 "/metrics",
                 get(get_metrics).with_state(self.metrics.clone()),

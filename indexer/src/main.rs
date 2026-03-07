@@ -130,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
     let (periodic_intake_tx, periodic_intake_rx) = workflow_core::channel::bounded(1);
     let (periodic_resp_tx, periodic_resp_rx) = workflow_core::channel::bounded(1);
     let (shutdown_ticker_tx, shutdown_ticker_rx) = tokio::sync::mpsc::channel(2);
+    let (push_event_tx, push_event_rx) = flume::bounded(4096);
 
     let mut block_processor = BlockProcessor::builder()
         .notification_rx(block_intake_rx.clone())
@@ -155,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
         .tx_id_to_payment_partition(tx_id_to_payment_partition.clone())
         .tx_id_to_acceptance_partition(tx_id_to_acceptance_partition.clone())
         .shared_metrics(metrics.clone())
+        .push_event_tx(push_event_tx)
         .build();
     let mut virtual_processor = VirtualProcessor::builder()
         .synced_capacity(3_000_000)
@@ -226,15 +228,17 @@ async fn main() -> anyhow::Result<()> {
         })
         .take(3_000_000)
         .collect::<Result<Vec<_>, _>>()?;
+    let push_service = push::PushService::from_context(&context).await?;
+    let push_dispatch_handle =
+        tokio::spawn(push_service.clone().run_dispatch_worker(push_event_rx));
+    let push_api = api::v1::push::PushApi::new(push_service.clone());
+
     let block_processor_handle = std::thread::spawn(move || block_processor.process());
     let virtual_processor_handle =
         std::thread::spawn(move || virtual_processor.process(processed_blocks, false));
     let periodic_processor_handle = std::thread::spawn(move || periodic_processor.process());
     let data_source_handle = tokio::spawn(async move { data_source.task().await });
     let ticker_handle = tokio::spawn(async move { ticker.process().await });
-
-    let push_service = push::PushService::from_context(&context).await?;
-    let push_api = api::v1::push::PushApi::new(push_service);
 
     let api_service = api::v1::Api::new(
         tx_keyspace.clone(),
@@ -313,6 +317,11 @@ async fn main() -> anyhow::Result<()> {
         .join()
         .expect("failed to join periodic_processor thread")
         .inspect_err(|err| error!("periodic_processor stopped error: {}", err));
+
+    info!("waiting for push dispatch worker finish");
+    _ = push_dispatch_handle
+        .await
+        .inspect_err(|err| error!("push dispatch worker stopped with join error: {}", err));
 
     info!("All tasks shut down.");
 

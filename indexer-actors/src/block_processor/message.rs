@@ -1,3 +1,4 @@
+use indexer_db::AddressPayload;
 use kaspa_rpc_core::RpcBlock;
 use std::sync::Arc;
 
@@ -26,4 +27,22 @@ pub enum GapFillingProgress {
         target: [u8; 32],
         err: workflow_rpc::client::error::Error,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PushMessageType {
+    Handshake,
+    Payment,
+    Contextual,
+}
+
+#[derive(Debug, Clone)]
+pub struct PushDispatchEvent {
+    pub message_type: PushMessageType,
+    pub tx_id: [u8; 32],
+    pub sender: Option<AddressPayload>,
+    pub receiver: AddressPayload,
+    pub amount: Option<u64>,
+    pub payload: Option<Vec<u8>>,
+    pub timestamp: u64,
 }

@@ -40,7 +40,6 @@ use protocol::operation::{
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use std::iter;
 use tracing::{debug, error, info, info_span, trace, warn};
 
 #[derive(bon::Builder)]
@@ -68,6 +67,7 @@ pub struct BlockProcessor {
     tx_id_to_payment_partition: TxIdToPaymentPartition,
     tx_id_to_acceptance_partition: TxIDToAcceptancePartition,
     shared_metrics: SharedMetrics,
+    push_event_tx: Option<flume::Sender<PushDispatchEvent>>,
     #[builder(default)]
     gaps_filling_in_progress: usize,
 }
@@ -170,10 +170,12 @@ impl BlockProcessor {
                     debug!(hash = %hash.to_hex_64(), daa_score = block.header.daa_score, tx_count = block.transactions.len(), "Processing block notification");
                     loop {
                         let mut wtx = self.tx_keyspace.write_tx()?;
-                        self.handle_block(&mut wtx, &block)?;
+                        let mut push_events = Vec::new();
+                        self.handle_block(&mut wtx, &block, &mut push_events, true)?;
                         last_processed_block = Some(hash);
                         self.update_block(&mut wtx, hash);
                         if wtx.commit()?.is_ok() {
+                            self.dispatch_push_events(push_events);
                             break;
                         } else {
                             warn!("conflict detected, retry handling block")
@@ -212,7 +214,8 @@ impl BlockProcessor {
                     blocks.iter().try_for_each(|block| -> anyhow::Result<()> {
                         loop {
                             let mut wtx = self.tx_keyspace.write_tx()?;
-                            self.handle_block(&mut wtx, block)?;
+                            let mut push_events = Vec::new();
+                            self.handle_block(&mut wtx, block, &mut push_events, false)?;
                             self.blocks_gap_partition.update_gap_wtx(
                                 &mut wtx,
                                 indexer_db::headers::block_gaps::BlockGap {
@@ -248,7 +251,8 @@ impl BlockProcessor {
                                     .entered();
                                 loop {
                                     let mut wtx = self.tx_keyspace.write_tx()?;
-                                    self.handle_block(&mut wtx, block)?;
+                                    let mut push_events = Vec::new();
+                                    self.handle_block(&mut wtx, block, &mut push_events, false)?;
                                     self.blocks_gap_partition.update_gap_wtx(
                                         &mut wtx,
                                         indexer_db::headers::block_gaps::BlockGap {
@@ -276,7 +280,8 @@ impl BlockProcessor {
                                         .entered();
                                 loop {
                                     let mut wtx = self.tx_keyspace.write_tx()?;
-                                    self.handle_block(&mut wtx, block)?;
+                                    let mut push_events = Vec::new();
+                                    self.handle_block(&mut wtx, block, &mut push_events, false)?;
                                     self.blocks_gap_partition.remove_gap_wtx(&mut wtx, &to);
                                     if wtx.commit()?.is_ok() {
                                         break;
@@ -315,6 +320,8 @@ impl BlockProcessor {
         &mut self,
         wtx: &mut WriteTransaction,
         block: &RpcBlock,
+        push_events: &mut Vec<PushDispatchEvent>,
+        collect_push_events: bool,
     ) -> anyhow::Result<()> {
         let already_processed = self.block_compact_header_partition.insert_compact_header(
             block.header.hash.as_ref(),
@@ -332,7 +339,7 @@ impl BlockProcessor {
         )?;
         debug!(hash = %block.header.hash.as_bytes().to_hex_64(), tx_count = block.transactions.len(), "Processing block transactions");
         for tx in &block.transactions {
-            self.handle_transaction(wtx, &block.header, tx)?;
+            self.handle_transaction(wtx, &block.header, tx, push_events, collect_push_events)?;
         }
         self.shared_metrics.increment_blocks_processed();
         trace!(hash = %block.header.hash.as_bytes().to_hex_64(), "Block handled successfully");
@@ -344,6 +351,8 @@ impl BlockProcessor {
         wtx: &mut WriteTransaction,
         block_header: &RpcHeader,
         tx: &RpcTransaction,
+        push_events: &mut Vec<PushDispatchEvent>,
+        collect_push_events: bool,
     ) -> anyhow::Result<()> {
         let tx_id = match &tx.verbose_data {
             Some(data) => data.transaction_id,
@@ -376,19 +385,33 @@ impl BlockProcessor {
             None
         };
         let mut entries: SmallVec<[_; 1]> = SmallVec::new();
-        iter::once(op).try_for_each(|op| match op {
+        let timestamp = block_header.timestamp;
+        let payload = tx.payload.clone();
+        let message_type = match op {
             SealedOperation::SealedMessageOrSealedHandshakeVNone(hk) => {
-                self.handle_handshake(&mut entries, wtx, block_header, tx_id, hk, receiver, sender)
+                self.handle_handshake(
+                    &mut entries,
+                    wtx,
+                    block_header,
+                    tx_id,
+                    hk,
+                    receiver,
+                    sender,
+                )?;
+                Some(PushMessageType::Handshake)
             }
-            SealedOperation::SealedHandshakeV2(hk) => self.handle_handshake_v2(
-                &mut entries,
-                wtx,
-                block_header,
-                tx_id,
-                hk,
-                receiver,
-                sender,
-            ),
+            SealedOperation::SealedHandshakeV2(hk) => {
+                self.handle_handshake_v2(
+                    &mut entries,
+                    wtx,
+                    block_header,
+                    tx_id,
+                    hk,
+                    receiver,
+                    sender,
+                )?;
+                Some(PushMessageType::Handshake)
+            }
             SealedOperation::ContextualMessageV1(cm) => {
                 self.handle_contextual_message(
                     &mut entries,
@@ -399,18 +422,21 @@ impl BlockProcessor {
                     cm,
                     receiver,
                 );
-                Ok(())
+                Some(PushMessageType::Contextual)
             }
-            SealedOperation::PaymentV1(pm) => self.handle_payment(
-                &mut entries,
-                wtx,
-                block_header,
-                tx_id,
-                receiver,
-                amount,
-                pm,
-                sender,
-            ),
+            SealedOperation::PaymentV1(pm) => {
+                self.handle_payment(
+                    &mut entries,
+                    wtx,
+                    block_header,
+                    tx_id,
+                    receiver,
+                    amount,
+                    pm,
+                    sender,
+                )?;
+                Some(PushMessageType::Payment)
+            }
             SealedOperation::SelfStashV1(sss) => {
                 self.handle_self_stash(
                     &mut entries,
@@ -421,9 +447,21 @@ impl BlockProcessor {
                     sss,
                     receiver,
                 );
-                Ok(())
+                None
             }
-        })?;
+        };
+
+        if collect_push_events && let Some(message_type) = message_type {
+            push_events.push(PushDispatchEvent {
+                message_type,
+                tx_id: tx_id.as_bytes(),
+                sender,
+                receiver,
+                amount: (matches!(message_type, PushMessageType::Payment)).then_some(amount),
+                payload: Some(payload),
+                timestamp,
+            });
+        }
         self.tx_id_to_acceptance_partition.insert_wtx(
             wtx,
             &AcceptanceKey {
@@ -491,6 +529,18 @@ impl BlockProcessor {
 
     fn update_block(&self, wtx: &mut WriteTransaction, hash: [u8; 32]) {
         self.metadata_partition.set_latest_block_cursor(wtx, hash)
+    }
+
+    fn dispatch_push_events(&self, push_events: Vec<PushDispatchEvent>) {
+        let Some(push_event_tx) = &self.push_event_tx else {
+            return;
+        };
+
+        for event in push_events {
+            if let Err(error) = push_event_tx.try_send(event) {
+                warn!(%error, "Dropping push dispatch event due to full/closed queue");
+            }
+        }
     }
 
     fn handle_handshake<const ENTRIES_LEN: usize, const KEY_SIZE: usize>(

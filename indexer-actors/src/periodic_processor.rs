@@ -134,9 +134,8 @@ impl PeriodicProcessor {
             self.contextual_message_by_sender_partition
                 .approximate_len() as u64,
         );
-        self.metrics.set_unknown_sender_entries(
-            self.pending_sender_resolution_partition.len()? as u64,
-        );
+        self.metrics
+            .set_unknown_sender_entries(self.pending_sender_resolution_partition.len()? as u64);
         self.metrics.set_latest_block(
             self.metadata_partition
                 .get_latest_block_cursor()?

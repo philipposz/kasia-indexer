@@ -1,4 +1,5 @@
 use crate::api::v1::contextual_messages::ContextualMessageApi;
+use crate::api::v1::gift::GiftApi;
 use crate::api::v1::handshakes::HandshakeApi;
 use crate::api::v1::payments::PaymentApi;
 use crate::api::v1::push::PushApi;
@@ -26,6 +27,7 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 pub mod contextual_messages;
+pub mod gift;
 pub mod handshakes;
 pub mod payments;
 pub mod push;
@@ -39,6 +41,8 @@ pub mod self_stash;
         contextual_messages::get_contextual_messages_by_sender,
         payments::get_payments_by_sender,
         payments::get_payments_by_receiver,
+        gift::create_challenge,
+        gift::claim_gift,
         push::create_challenge,
         push::register_device,
         push::update_device,
@@ -47,7 +51,7 @@ pub mod self_stash;
         get_metrics,
     ),
     components(
-        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, IndexerMetricsSnapshot)
+        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, gift::GiftChallengeResponse, gift::GiftClaimRequest, gift::GiftClaimResponse, gift::GiftErrorResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, IndexerMetricsSnapshot)
     ),
     tags(
         (name = "Kasia Indexer API", description = "Kasia Indexer API")
@@ -60,6 +64,7 @@ pub struct Api {
     handshake_api: HandshakeApi,
     contextual_message_api: ContextualMessageApi,
     payment_api: PaymentApi,
+    gift_api: GiftApi,
     push_api: PushApi,
     self_stash_api: SelfStashApi,
     metrics: SharedMetrics,
@@ -80,6 +85,7 @@ impl Api {
         tx_id_to_payment_partition: TxIdToPaymentPartition,
         self_stash_by_owner_partition: SelfStashByOwnerPartition,
         tx_id_to_self_stash_partition: TxIdToSelfStashPartition,
+        gift_api: GiftApi,
         push_api: PushApi,
         metrics: SharedMetrics,
         context: IndexerContext,
@@ -122,6 +128,7 @@ impl Api {
             handshake_api,
             contextual_message_api,
             payment_api,
+            gift_api,
             push_api,
             self_stash_api,
             metrics,
@@ -137,7 +144,7 @@ impl Api {
         let app = self.router();
         let listener = tokio::net::TcpListener::bind(addr).await?;
         tracing::info!("Starting API server on {}", addr);
-        axum::serve(listener, app.into_make_service())
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(async move {
                 shutdown.recv().await;
             })
@@ -163,6 +170,10 @@ impl Api {
             .nest(
                 "/self-stash",
                 SelfStashApi::router().with_state(self.self_stash_api.clone()),
+            )
+            .nest(
+                "/v1/gift",
+                GiftApi::router().with_state(self.gift_api.clone()),
             )
             .nest(
                 "/v1/push",

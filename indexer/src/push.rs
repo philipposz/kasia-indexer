@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
@@ -24,6 +25,9 @@ pub struct PushService {
     registrations: Arc<RwLock<HashMap<String, DeviceRegistration>>>,
     challenges: Arc<RwLock<HashMap<String, ChallengeEntry>>>,
     apns_client: Option<Arc<ApnsClient>>,
+    recent_dispatches: Arc<Mutex<HashMap<String, u64>>>,
+    dispatch_dedupe_ttl_ms: u64,
+    dispatch_counters: Arc<PushDispatchCounters>,
 }
 
 #[derive(Clone, Debug)]
@@ -64,11 +68,72 @@ impl PushConfig {
     }
 }
 
+#[derive(Debug, Default)]
+struct PushDispatchCounters {
+    events: AtomicU64,
+    targets: AtomicU64,
+    attempts: AtomicU64,
+    sent: AtomicU64,
+    invalid: AtomicU64,
+    failed: AtomicU64,
+    deduped: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PushDispatchSnapshot {
+    events: u64,
+    targets: u64,
+    attempts: u64,
+    sent: u64,
+    invalid: u64,
+    failed: u64,
+    deduped: u64,
+}
+
+impl PushDispatchCounters {
+    fn snapshot(&self) -> PushDispatchSnapshot {
+        PushDispatchSnapshot {
+            events: self.events.load(Ordering::Relaxed),
+            targets: self.targets.load(Ordering::Relaxed),
+            attempts: self.attempts.load(Ordering::Relaxed),
+            sent: self.sent.load(Ordering::Relaxed),
+            invalid: self.invalid.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            deduped: self.deduped.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl PushDispatchSnapshot {
+    fn delta_since(self, previous: Self) -> Self {
+        Self {
+            events: self.events.saturating_sub(previous.events),
+            targets: self.targets.saturating_sub(previous.targets),
+            attempts: self.attempts.saturating_sub(previous.attempts),
+            sent: self.sent.saturating_sub(previous.sent),
+            invalid: self.invalid.saturating_sub(previous.invalid),
+            failed: self.failed.saturating_sub(previous.failed),
+            deduped: self.deduped.saturating_sub(previous.deduped),
+        }
+    }
+
+    fn has_activity(self) -> bool {
+        self.events > 0
+            || self.targets > 0
+            || self.attempts > 0
+            || self.sent > 0
+            || self.invalid > 0
+            || self.failed > 0
+            || self.deduped > 0
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct DeviceRegistration {
     device_token: String,
     token_type: String,
     platform: String,
+    app_bundle_id: Option<String>,
     watched_addresses: HashSet<String>,
     primary_address: Option<String>,
     aliases: Vec<String>,
@@ -157,6 +222,7 @@ pub struct PushRegistrationRequest {
     pub device_token: String,
     pub token_type: String,
     pub platform: String,
+    pub app_bundle_id: Option<String>,
     pub watched_addresses: Vec<String>,
     pub primary_address: Option<String>,
     pub aliases: Option<Vec<String>>,
@@ -168,6 +234,7 @@ pub struct PushRegistrationRequest {
 pub struct PushUpdateRequest {
     pub device_token: String,
     pub token_type: String,
+    pub app_bundle_id: Option<String>,
     pub watched_addresses: Vec<String>,
     pub primary_address: Option<String>,
     pub aliases: Option<Vec<String>>,
@@ -229,22 +296,71 @@ impl PushService {
             registrations: Arc::new(RwLock::new(registrations)),
             challenges: Arc::new(RwLock::new(HashMap::new())),
             apns_client,
+            recent_dispatches: Arc::new(Mutex::new(HashMap::new())),
+            dispatch_dedupe_ttl_ms: 15 * 60 * 1000,
+            dispatch_counters: Arc::new(PushDispatchCounters::default()),
         })
     }
 
     pub async fn run_dispatch_worker(self, event_rx: flume::Receiver<PushDispatchEvent>) {
         info!("Push dispatch worker started");
 
-        while let Ok(event) = event_rx.recv_async().await {
-            if let Err(error) = self.dispatch_event(event).await {
-                warn!(%error, "Push dispatch failed");
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(10));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut previous_snapshot = self.dispatch_counters.snapshot();
+
+        loop {
+            tokio::select! {
+                event = event_rx.recv_async() => {
+                    let Ok(event) = event else {
+                        break;
+                    };
+                    if let Err(error) = self.dispatch_event(event).await {
+                        warn!(%error, "Push dispatch failed");
+                    }
+                }
+                _ = ticker.tick() => {
+                    self.log_dispatch_monitor(&mut previous_snapshot);
+                }
             }
         }
+
+        self.log_dispatch_monitor(&mut previous_snapshot);
 
         info!("Push dispatch worker stopped");
     }
 
+    fn log_dispatch_monitor(&self, previous_snapshot: &mut PushDispatchSnapshot) {
+        let current = self.dispatch_counters.snapshot();
+        let delta = current.delta_since(*previous_snapshot);
+        if !delta.has_activity() {
+            return;
+        }
+
+        info!(
+            events_delta = delta.events,
+            targets_delta = delta.targets,
+            attempts_delta = delta.attempts,
+            sent_delta = delta.sent,
+            invalid_delta = delta.invalid,
+            failed_delta = delta.failed,
+            deduped_delta = delta.deduped,
+            events_total = current.events,
+            targets_total = current.targets,
+            attempts_total = current.attempts,
+            sent_total = current.sent,
+            invalid_total = current.invalid,
+            failed_total = current.failed,
+            deduped_total = current.deduped,
+            "APNs monitor"
+        );
+
+        *previous_snapshot = current;
+    }
+
     async fn dispatch_event(&self, event: PushDispatchEvent) -> anyhow::Result<()> {
+        self.dispatch_counters.events.fetch_add(1, Ordering::Relaxed);
+
         let Some(apns_client) = &self.apns_client else {
             return Ok(());
         };
@@ -265,6 +381,9 @@ impl PushService {
                 receiver_address.as_deref(),
             )
             .await;
+        self.dispatch_counters
+            .targets
+            .fetch_add(targets.len() as u64, Ordering::Relaxed);
 
         if targets.is_empty() {
             return Ok(());
@@ -282,11 +401,13 @@ impl PushService {
             "aps".to_string(),
             json!({
                 "alert": {
-                    "title": "KaChat",
+                    "title": "KBeam",
                     "body": match event.message_type {
                         PushMessageType::Payment => "Received payment",
                         PushMessageType::Handshake => "Started a conversation",
-                        PushMessageType::Contextual => "New message",
+                        // Contextual payload text is rendered by the iOS notification service extension.
+                        // Keep backend fallback neutral to avoid leaking control-payload noise if extension processing fails.
+                        PushMessageType::Contextual => " ",
                     }
                 },
                 "mutable-content": 1,
@@ -314,11 +435,30 @@ impl PushService {
 
         let mut stale_tokens = Vec::new();
         for registration in targets {
+            if self
+                .was_recently_dispatched(&registration.device_token, &tx_id, event.message_type)
+                .await
+            {
+                self.dispatch_counters.deduped.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    token = %registration.device_token,
+                    tx_id = %tx_id,
+                    "Skipping duplicate push dispatch"
+                );
+                continue;
+            }
+
+            self.dispatch_counters.attempts.fetch_add(1, Ordering::Relaxed);
+
             match apns_client
                 .send_notification(&registration.device_token, &payload)
                 .await
             {
                 Ok(ApnsSendOutcome::Sent) => {
+                    self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
+                    self
+                        .mark_recent_dispatch(&registration.device_token, &tx_id, event.message_type)
+                        .await;
                     debug!(
                         token = %registration.device_token,
                         tx_id = %tx_id,
@@ -326,10 +466,12 @@ impl PushService {
                     );
                 }
                 Ok(ApnsSendOutcome::InvalidToken) => {
+                    self.dispatch_counters.invalid.fetch_add(1, Ordering::Relaxed);
                     warn!(token = %registration.device_token, "APNs token is invalid, pruning registration");
                     stale_tokens.push(registration.device_token);
                 }
                 Err(error) => {
+                    self.dispatch_counters.failed.fetch_add(1, Ordering::Relaxed);
                     warn!(
                         %error,
                         token = %registration.device_token,
@@ -347,6 +489,38 @@ impl PushService {
         Ok(())
     }
 
+    async fn was_recently_dispatched(
+        &self,
+        device_token: &str,
+        tx_id: &str,
+        message_type: PushMessageType,
+    ) -> bool {
+        let now = now_ms();
+        let cutoff = now.saturating_sub(self.dispatch_dedupe_ttl_ms);
+        let mut recent = self.recent_dispatches.lock().await;
+        recent.retain(|_, ts| *ts >= cutoff);
+        let key = Self::dispatch_dedupe_key(device_token, tx_id, message_type);
+        recent.contains_key(&key)
+    }
+
+    async fn mark_recent_dispatch(
+        &self,
+        device_token: &str,
+        tx_id: &str,
+        message_type: PushMessageType,
+    ) {
+        let now = now_ms();
+        let cutoff = now.saturating_sub(self.dispatch_dedupe_ttl_ms);
+        let mut recent = self.recent_dispatches.lock().await;
+        recent.retain(|_, ts| *ts >= cutoff);
+        let key = Self::dispatch_dedupe_key(device_token, tx_id, message_type);
+        recent.insert(key, now);
+    }
+
+    fn dispatch_dedupe_key(device_token: &str, tx_id: &str, _message_type: PushMessageType) -> String {
+        format!("{device_token}:{tx_id}")
+    }
+
     async fn matching_registrations(
         &self,
         message_type: PushMessageType,
@@ -354,10 +528,22 @@ impl PushService {
         receiver_address: Option<&str>,
     ) -> Vec<DeviceRegistration> {
         let registrations = self.registrations.read().await;
+        let configured_bundle_id = self
+            .config
+            .apns_bundle_id
+            .as_deref()
+            .and_then(normalize_bundle_id);
 
         registrations
             .values()
             .filter(|registration| registration.token_type == "apns")
+            .filter(|registration| {
+                if let Some(required_bundle_id) = configured_bundle_id.as_deref() {
+                    registration.app_bundle_id.as_deref() == Some(required_bundle_id)
+                } else {
+                    true
+                }
+            })
             .filter(|registration| match message_type {
                 PushMessageType::Contextual => {
                     registration.watched_addresses.contains(sender_address)
@@ -427,6 +613,7 @@ impl PushService {
         self.validate_token_and_type(&token, &token_type)?;
 
         let auth = self.validate_auth(request.auth.as_ref()).await?;
+        let app_bundle_id = normalize_optional_bundle_id(request.app_bundle_id.as_deref());
         let watched_addresses = normalize_addresses(request.watched_addresses);
         let primary_address = normalize_optional_address(request.primary_address.as_deref());
         let aliases = normalize_aliases(request.aliases.unwrap_or_default());
@@ -451,6 +638,7 @@ impl PushService {
                 device_token: token,
                 token_type,
                 platform: request.platform.trim().to_lowercase(),
+                app_bundle_id,
                 watched_addresses,
                 primary_address,
                 aliases,
@@ -477,6 +665,7 @@ impl PushService {
         self.validate_token_and_type(&token, &token_type)?;
 
         let auth = self.validate_auth(request.auth.as_ref()).await?;
+        let app_bundle_id = normalize_optional_bundle_id(request.app_bundle_id.as_deref());
         let watched_addresses = normalize_addresses(request.watched_addresses);
         let primary_address = normalize_optional_address(request.primary_address.as_deref());
         let aliases = normalize_aliases(request.aliases.unwrap_or_default());
@@ -493,6 +682,7 @@ impl PushService {
         }
 
         registration.token_type = token_type;
+        registration.app_bundle_id = app_bundle_id;
         registration.watched_addresses = watched_addresses;
         registration.primary_address = primary_address;
         registration.aliases = aliases;
@@ -795,6 +985,14 @@ fn is_invalid_token_response(status: HttpStatusCode, reason: &str) -> bool {
     )
 }
 
+fn push_message_type_tag(message_type: PushMessageType) -> &'static str {
+    match message_type {
+        PushMessageType::Handshake => "handshake",
+        PushMessageType::Payment => "payment",
+        PushMessageType::Contextual => "contextual",
+    }
+}
+
 fn normalize_addresses(values: Vec<String>) -> HashSet<String> {
     values
         .into_iter()
@@ -822,6 +1020,19 @@ fn normalize_aliases(values: Vec<String>) -> Vec<String> {
 
 fn normalize_optional_address(value: Option<&str>) -> Option<String> {
     value.and_then(normalize_address)
+}
+
+fn normalize_optional_bundle_id(value: Option<&str>) -> Option<String> {
+    value.and_then(normalize_bundle_id)
+}
+
+fn normalize_bundle_id(value: &str) -> Option<String> {
+    let normalized = value.trim().to_lowercase();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 fn normalize_address(value: &str) -> Option<String> {

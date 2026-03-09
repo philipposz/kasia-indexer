@@ -44,6 +44,7 @@ use workflow_core::channel::Channel;
 mod api;
 mod config;
 mod context;
+mod gift;
 mod push;
 mod signals;
 
@@ -231,6 +232,8 @@ async fn main() -> anyhow::Result<()> {
     let push_service = push::PushService::from_context(&context).await?;
     let push_dispatch_handle =
         tokio::spawn(push_service.clone().run_dispatch_worker(push_event_rx));
+    let gift_service = gift::GiftService::from_context(&context).await?;
+    let gift_api = api::v1::gift::GiftApi::new(gift_service.clone());
     let push_api = api::v1::push::PushApi::new(push_service.clone());
 
     let block_processor_handle = std::thread::spawn(move || block_processor.process());
@@ -253,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
         tx_id_to_payment_partition,
         self_stash_by_owner_partition,
         tx_id_to_self_stash_partition,
+        gift_api,
         push_api,
         metrics.clone(),
         context.clone(),

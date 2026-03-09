@@ -17,6 +17,8 @@ use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+const PUSH_SUPPRESSED_ALIAS_SUFFIX: &str = "__silent";
+
 #[derive(Clone)]
 pub struct PushService {
     config: PushConfig,
@@ -373,6 +375,27 @@ impl PushService {
             return Ok(());
         };
         let receiver_address = self.address_payload_to_string(&event.receiver)?;
+        let contextual_alias = if matches!(event.message_type, PushMessageType::Contextual) {
+            event
+                .payload
+                .as_deref()
+                .and_then(extract_contextual_alias)
+        } else {
+            None
+        };
+
+        if contextual_alias
+            .as_deref()
+            .is_some_and(is_push_suppressed_alias)
+        {
+            debug!(
+                tx_id = %faster_hex::hex_string(&event.tx_id),
+                sender = %sender_address,
+                alias = %contextual_alias.unwrap_or_default(),
+                "Skipping push dispatch for push-suppressed contextual alias"
+            );
+            return Ok(());
+        }
 
         let targets = self
             .matching_registrations(
@@ -545,9 +568,7 @@ impl PushService {
                 }
             })
             .filter(|registration| match message_type {
-                PushMessageType::Contextual => {
-                    registration.watched_addresses.contains(sender_address)
-                }
+                PushMessageType::Contextual => registration.watched_addresses.contains(sender_address),
                 PushMessageType::Handshake | PushMessageType::Payment => {
                     let Some(receiver) = receiver_address else {
                         return false;
@@ -1018,8 +1039,37 @@ fn normalize_aliases(values: Vec<String>) -> Vec<String> {
     aliases
 }
 
+fn extract_contextual_alias(payload: &[u8]) -> Option<String> {
+    let payload = std::str::from_utf8(payload).ok()?;
+    let mut parts = payload.splitn(5, ':');
+
+    if parts.next()? != "ciph_msg" {
+        return None;
+    }
+    if parts.next()? != "1" {
+        return None;
+    }
+    if parts.next()? != "comm" {
+        return None;
+    }
+
+    let alias = parts.next()?.trim();
+    if alias.is_empty() {
+        return None;
+    }
+
+    Some(alias.to_string())
+}
+
+fn is_push_suppressed_alias(alias: &str) -> bool {
+    alias
+        .trim()
+        .ends_with(PUSH_SUPPRESSED_ALIAS_SUFFIX)
+}
+
 fn normalize_optional_address(value: Option<&str>) -> Option<String> {
-    value.and_then(normalize_address)
+    value
+        .and_then(normalize_address)
 }
 
 fn normalize_optional_bundle_id(value: Option<&str>) -> Option<String> {

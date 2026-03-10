@@ -674,23 +674,19 @@ impl AppAttestVerifier {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("GIFT_APPATTEST_BUNDLE_ID is not set"))?;
 
-        let environment = match config.appattest_environment.as_str() {
-            "sandbox" | "development" => "development",
-            "production" | "prod" => "production",
+        let expected_aaguids = match config.appattest_environment.as_str() {
+            "sandbox" | "development" => vec![APP_ATTEST_AAGUID_DEVELOPMENT],
+            "production" | "prod" => vec![APP_ATTEST_AAGUID_PRODUCTION],
             "auto" => {
+                // In auto mode we accept both environments to avoid hard failures when
+                // development-signed devices hit mainnet infra (or vice versa).
                 if matches!(network, RpcNetworkType::Mainnet) {
-                    "production"
+                    vec![APP_ATTEST_AAGUID_PRODUCTION, APP_ATTEST_AAGUID_DEVELOPMENT]
                 } else {
-                    "development"
+                    vec![APP_ATTEST_AAGUID_DEVELOPMENT, APP_ATTEST_AAGUID_PRODUCTION]
                 }
             }
             value => anyhow::bail!("unsupported GIFT_APPATTEST_ENVIRONMENT value: {value}"),
-        };
-
-        let expected_aaguids = if environment == "production" {
-            vec![APP_ATTEST_AAGUID_PRODUCTION]
-        } else {
-            vec![APP_ATTEST_AAGUID_DEVELOPMENT]
         };
 
         let app_id = format!("{}.{}", team_id.trim(), bundle_id.trim());

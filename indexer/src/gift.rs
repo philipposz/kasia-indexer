@@ -217,6 +217,7 @@ struct GiftClaimsSnapshot {
 struct DeviceCheckClient {
     client: reqwest::Client,
     host: String,
+    secondary_host: Option<String>,
     team_id: String,
     key_id: String,
     encoding_key: EncodingKey,
@@ -787,14 +788,23 @@ impl DeviceCheckClient {
         let encoding_key = EncodingKey::from_ec_pem(&key_bytes)
             .context("failed to parse DeviceCheck private key (.p8 PEM expected)")?;
 
-        let host = match config.devicecheck_environment.as_str() {
-            "sandbox" | "development" => "https://api.development.devicecheck.apple.com".to_string(),
-            "production" | "prod" => "https://api.devicecheck.apple.com".to_string(),
+        let (host, secondary_host) = match config.devicecheck_environment.as_str() {
+            "sandbox" | "development" => (
+                "https://api.development.devicecheck.apple.com".to_string(),
+                None,
+            ),
+            "production" | "prod" => ("https://api.devicecheck.apple.com".to_string(), None),
             "auto" => {
                 if matches!(network, RpcNetworkType::Mainnet) {
-                    "https://api.devicecheck.apple.com".to_string()
+                    (
+                        "https://api.devicecheck.apple.com".to_string(),
+                        Some("https://api.development.devicecheck.apple.com".to_string()),
+                    )
                 } else {
-                    "https://api.development.devicecheck.apple.com".to_string()
+                    (
+                        "https://api.development.devicecheck.apple.com".to_string(),
+                        Some("https://api.devicecheck.apple.com".to_string()),
+                    )
                 }
             }
             value => anyhow::bail!("unsupported GIFT_DEVICECHECK_ENVIRONMENT value: {value}"),
@@ -808,10 +818,15 @@ impl DeviceCheckClient {
         Ok(Self {
             client,
             host,
+            secondary_host,
             team_id,
             key_id,
             encoding_key,
         })
+    }
+
+    fn host_candidates(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.host.as_str()).chain(self.secondary_host.as_deref())
     }
 
     async fn query_bit0(&self, device_token: &str) -> anyhow::Result<bool> {
@@ -823,27 +838,70 @@ impl DeviceCheckClient {
             timestamp,
         };
 
-        let response = self
-            .client
-            .post(format!("{}/v1/query_two_bits", self.host))
-            .bearer_auth(self.auth_token()?)
-            .json(&request)
-            .send()
-            .await
-            .context("failed to call DeviceCheck query_two_bits")?;
+        let auth_token = self.auth_token()?;
+        let mut attempt_errors: Vec<String> = Vec::new();
 
-        if response.status().is_success() {
-            let payload: DeviceCheckQueryResponse = response
-                .json()
+        for (attempt_index, host) in self.host_candidates().enumerate() {
+            let response = match self
+                .client
+                .post(format!("{host}/v1/query_two_bits"))
+                .bearer_auth(&auth_token)
+                .json(&request)
+                .send()
                 .await
-                .context("failed to decode DeviceCheck query response")?;
-            return Ok(payload.bit0.unwrap_or(false));
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let detail = format!("host={} transport_error={}", host, error);
+                    let should_retry = attempt_index == 0 && self.secondary_host.is_some();
+                    if should_retry {
+                        warn!("DeviceCheck query retrying alternate host after {}", detail);
+                        attempt_errors.push(detail);
+                        continue;
+                    }
+                    anyhow::bail!("failed to call DeviceCheck query_two_bits ({detail})");
+                }
+            };
+
+            if response.status().is_success() {
+                let payload: DeviceCheckQueryResponse = response
+                    .json()
+                    .await
+                    .context("failed to decode DeviceCheck query response")?;
+                return Ok(payload.bit0.unwrap_or(false));
+            }
+
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let reason = parse_devicecheck_reason(&body).unwrap_or_else(|| "unknown".to_string());
+            let detail = format!("host={} status={} reason={}", host, status, reason);
+            let should_retry = attempt_index == 0
+                && self.secondary_host.is_some()
+                && matches!(status, HttpStatusCode::BAD_REQUEST | HttpStatusCode::UNAUTHORIZED);
+
+            if should_retry {
+                warn!("DeviceCheck query retrying alternate host after {}", detail);
+                attempt_errors.push(detail);
+                continue;
+            }
+
+            if status == HttpStatusCode::UNAUTHORIZED {
+                anyhow::bail!(
+                    "DeviceCheck query auth rejected {} (check GIFT_DEVICECHECK_TEAM_ID, GIFT_DEVICECHECK_KEY_ID, GIFT_DEVICECHECK_KEY_PATH)",
+                    detail
+                );
+            }
+
+            anyhow::bail!("DeviceCheck query failed {}", detail);
         }
 
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let reason = parse_devicecheck_reason(&body).unwrap_or_else(|| "unknown".to_string());
-        anyhow::bail!("DeviceCheck query failed status={} reason={}", status, reason)
+        if attempt_errors.is_empty() {
+            anyhow::bail!("DeviceCheck query failed: no host candidates available");
+        }
+        anyhow::bail!(
+            "DeviceCheck query failed after host fallback {}",
+            attempt_errors.join(" -> ")
+        )
     }
 
     async fn update_bit0_true(&self, device_token: &str) -> anyhow::Result<()> {
@@ -857,28 +915,66 @@ impl DeviceCheckClient {
             bit1: false,
         };
 
-        let response = self
-            .client
-            .post(format!("{}/v1/update_two_bits", self.host))
-            .bearer_auth(self.auth_token()?)
-            .json(&request)
-            .send()
-            .await
-            .context("failed to call DeviceCheck update_two_bits")?;
+        let auth_token = self.auth_token()?;
+        let mut attempt_errors: Vec<String> = Vec::new();
 
-        if response.status().is_success() {
-            return Ok(());
+        for (attempt_index, host) in self.host_candidates().enumerate() {
+            let response = match self
+                .client
+                .post(format!("{host}/v1/update_two_bits"))
+                .bearer_auth(&auth_token)
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let detail = format!("host={} transport_error={}", host, error);
+                    let should_retry = attempt_index == 0 && self.secondary_host.is_some();
+                    if should_retry {
+                        warn!("DeviceCheck update retrying alternate host after {}", detail);
+                        attempt_errors.push(detail);
+                        continue;
+                    }
+                    anyhow::bail!("failed to call DeviceCheck update_two_bits ({detail})");
+                }
+            };
+
+            if response.status().is_success() {
+                return Ok(());
+            }
+
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let reason = parse_devicecheck_reason(&body).unwrap_or_else(|| "unknown".to_string());
+            let detail = format!("host={} status={} reason={}", host, status, reason);
+            let should_retry = attempt_index == 0
+                && self.secondary_host.is_some()
+                && matches!(status, HttpStatusCode::BAD_REQUEST | HttpStatusCode::UNAUTHORIZED);
+
+            if should_retry {
+                warn!("DeviceCheck update retrying alternate host after {}", detail);
+                attempt_errors.push(detail);
+                continue;
+            }
+
+            if status == HttpStatusCode::UNAUTHORIZED {
+                anyhow::bail!(
+                    "DeviceCheck update auth rejected {} (check GIFT_DEVICECHECK_TEAM_ID, GIFT_DEVICECHECK_KEY_ID, GIFT_DEVICECHECK_KEY_PATH)",
+                    detail
+                );
+            }
+
+            anyhow::bail!("DeviceCheck update failed {}", detail);
         }
 
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let reason = parse_devicecheck_reason(&body).unwrap_or_else(|| "unknown".to_string());
-
-        if status == HttpStatusCode::UNAUTHORIZED {
-            anyhow::bail!("DeviceCheck auth rejected reason={reason}");
+        if attempt_errors.is_empty() {
+            anyhow::bail!("DeviceCheck update failed: no host candidates available");
         }
-
-        anyhow::bail!("DeviceCheck update failed status={} reason={}", status, reason)
+        anyhow::bail!(
+            "DeviceCheck update failed after host fallback {}",
+            attempt_errors.join(" -> ")
+        )
     }
 
     fn auth_token(&self) -> anyhow::Result<String> {

@@ -725,7 +725,14 @@ impl AppAttestVerifier {
             .iter()
             .any(|candidate| *candidate == auth_data.aaguid)
         {
-            anyhow::bail!("unexpected app attest environment");
+            let aaguid_hex = format_aaguid_hex(&auth_data.aaguid);
+            if !is_probable_app_attest_aaguid(&auth_data.aaguid) {
+                anyhow::bail!("unexpected app attest environment ({aaguid_hex})");
+            }
+            warn!(
+                aaguid = %aaguid_hex,
+                "Gift App Attest received non-canonical AAGUID, accepting as App Attest"
+            );
         }
 
         let key_id_bytes = decode_base64_any(key_id)
@@ -974,6 +981,14 @@ fn parse_auth_data(auth_data: &[u8]) -> anyhow::Result<ParsedAuthData> {
         aaguid,
         credential_id,
     })
+}
+
+fn is_probable_app_attest_aaguid(aaguid: &[u8; 16]) -> bool {
+    aaguid.starts_with(b"appattest")
+}
+
+fn format_aaguid_hex(aaguid: &[u8; 16]) -> String {
+    aaguid.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn expect_cbor_map<'a>(

@@ -1405,7 +1405,16 @@ fn parse_devicecheck_query_bit0(body: &str) -> anyhow::Result<bool> {
         return Ok(extracted_bit0);
     }
 
+    if is_missing_devicecheck_bit_state_response(trimmed) {
+        return Ok(false);
+    }
+
     anyhow::bail!("DeviceCheck query response is not parseable")
+}
+
+fn is_missing_devicecheck_bit_state_response(body: &str) -> bool {
+    body.to_ascii_lowercase()
+        .contains("failed to find bit state")
 }
 
 fn parse_devicecheck_bit0_from_json_value(payload: &serde_json::Value) -> anyhow::Result<bool> {

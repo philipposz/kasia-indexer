@@ -11,8 +11,14 @@ pub struct IndexerConfig {
     #[serde(default = "default_network_type")]
     pub network_type: NetworkType,
     pub kaspa_node_wborsh_url: Option<String>,
+    #[serde(default = "default_indexer_pruning_depth")]
+    pub indexer_pruning_depth: u64,
     #[serde(default = "default_periodic_processor_interval_secs")]
     pub periodic_processor_interval_secs: u64,
+}
+
+fn default_indexer_pruning_depth() -> u64 {
+    3_000_000
 }
 
 fn default_periodic_processor_interval_secs() -> u64 {

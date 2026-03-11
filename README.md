@@ -140,6 +140,10 @@ NETWORK_TYPE=mainnet
 # if not defined, fallback to public kaspa network, if specified, the `ws://{ip}:{port}` node url
 #KASPA_NODE_WBORSH_URL=
 
+# DAA-score depth used for periodic pruning and in-memory processed-block cache.
+# Lower values keep less historical data. For ~1 day retention, use ~86400.
+INDEXER_PRUNING_DEPTH=3000000
+
 # iOS-first push profile
 PUSH_PROVIDER=apns
 PUSH_IOS_ENABLED=true

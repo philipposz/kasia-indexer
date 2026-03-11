@@ -10,6 +10,7 @@ services:
       NETWORK_TYPE: ${NETWORK_TYPE:-mainnet}
       KASIA_INDEXER_DB_ROOT: /data
       KASPA_NODE_WBORSH_URL: ${KASPA_NODE_WBORSH_URL:-}
+      INDEXER_PRUNING_DEPTH: ${INDEXER_PRUNING_DEPTH:-3000000}
 
       # iOS-first push profile (APNs primary, FCM optional/off)
       PUSH_PROVIDER: ${PUSH_PROVIDER:-apns}

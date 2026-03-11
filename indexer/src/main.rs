@@ -65,6 +65,9 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::new(context.clone().db_path).max_write_buffer_size(512 * 1024 * 1024);
     let tx_keyspace = config.open_transactional()?;
     let virtual_daa = Arc::new(AtomicU64::new(0));
+    let pruning_depth = context.config.indexer_pruning_depth;
+    let synced_capacity = usize::try_from(pruning_depth).unwrap_or(usize::MAX);
+    info!(pruning_depth, "Using indexer pruning depth");
     // Partitions
     let metadata_partition = MetadataPartition::new(&tx_keyspace)?;
     {
@@ -160,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
         .push_event_tx(push_event_tx)
         .build();
     let mut virtual_processor = VirtualProcessor::builder()
-        .synced_capacity(3_000_000)
+        .synced_capacity(synced_capacity)
         .processed_block_tx(processed_block_rx)
         .realtime_vcc_tx(vcc_intake_rx)
         .syncer_rx(syncer_rx)
@@ -189,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let periodic_processor = PeriodicProcessor::builder()
-        .pruning_depth(3_000_000)
+        .pruning_depth(pruning_depth)
         .job_trigger_rx(periodic_intake_rx)
         .resp_tx(periodic_resp_tx)
         .metrics(metrics.clone())
@@ -227,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
                 daa_score: k.daa_score.get(),
             })
         })
-        .take(3_000_000)
+        .take(synced_capacity)
         .collect::<Result<Vec<_>, _>>()?;
     let push_service = push::PushService::from_context(&context).await?;
     let push_dispatch_handle =

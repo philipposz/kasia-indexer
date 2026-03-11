@@ -237,11 +237,6 @@ struct DeviceCheckQueryRequest<'a> {
     timestamp: u64,
 }
 
-#[derive(Deserialize)]
-struct DeviceCheckQueryResponse {
-    bit0: Option<bool>,
-}
-
 #[derive(Serialize)]
 struct DeviceCheckUpdateRequest<'a> {
     device_token: &'a str,
@@ -864,11 +859,17 @@ impl DeviceCheckClient {
             };
 
             if response.status().is_success() {
-                let payload: DeviceCheckQueryResponse = response
-                    .json()
+                let body = response
+                    .text()
                     .await
-                    .context("failed to decode DeviceCheck query response")?;
-                return Ok(payload.bit0.unwrap_or(false));
+                    .context("failed to read DeviceCheck query response body")?;
+                let bit0 = parse_devicecheck_query_bit0(&body).with_context(|| {
+                    format!(
+                        "failed to decode DeviceCheck query response body={}",
+                        summarize_devicecheck_body_for_log(&body)
+                    )
+                })?;
+                return Ok(bit0);
             }
 
             let status = response.status();
@@ -1224,6 +1225,65 @@ fn parse_devicecheck_reason(body: &str) -> Option<String> {
     serde_json::from_str::<DeviceCheckErrorResponse>(body)
         .ok()
         .and_then(|payload| payload.reason)
+}
+
+fn parse_devicecheck_query_bit0(body: &str) -> anyhow::Result<bool> {
+    let payload: serde_json::Value =
+        serde_json::from_str(body).context("DeviceCheck query response is not valid JSON")?;
+
+    match payload.get("bit0") {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(serde_json::Value::Number(value)) => match value.as_i64() {
+            Some(0) => Ok(false),
+            Some(1) => Ok(true),
+            Some(other) => anyhow::bail!("DeviceCheck bit0 number must be 0 or 1, got {other}"),
+            None => anyhow::bail!("DeviceCheck bit0 number is out of range"),
+        },
+        Some(serde_json::Value::String(value)) => {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" => Ok(false),
+                "1" | "true" => Ok(true),
+                other => anyhow::bail!(
+                    "DeviceCheck bit0 string must be true/false/0/1, got {other}"
+                ),
+            }
+        }
+        Some(value) => anyhow::bail!(
+            "DeviceCheck bit0 has unsupported JSON type {}",
+            devicecheck_json_type(value)
+        ),
+    }
+}
+
+fn devicecheck_json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn summarize_devicecheck_body_for_log(body: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let mut result = String::new();
+    let mut chars = body.chars();
+
+    for _ in 0..MAX_CHARS {
+        match chars.next() {
+            Some(value) => result.push(value),
+            None => return result,
+        }
+    }
+
+    if chars.next().is_some() {
+        result.push('…');
+    }
+
+    result
 }
 
 fn claim_consumes_unique_slot(claim: &GiftClaimRecord) -> bool {

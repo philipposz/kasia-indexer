@@ -52,6 +52,7 @@ pub struct GiftConfig {
     pub devicecheck_key_id: Option<String>,
     pub devicecheck_key_path: Option<PathBuf>,
     pub devicecheck_timeout_ms: u64,
+    pub devicecheck_debug_secret: Option<String>,
     pub payout_command: Option<String>,
     pub payout_timeout_ms: u64,
 }
@@ -87,6 +88,7 @@ impl GiftConfig {
             devicecheck_key_id: read_env_string("GIFT_DEVICECHECK_KEY_ID"),
             devicecheck_key_path: read_env_string("GIFT_DEVICECHECK_KEY_PATH").map(PathBuf::from),
             devicecheck_timeout_ms: read_env_u64("GIFT_DEVICECHECK_TIMEOUT_MS", 10_000),
+            devicecheck_debug_secret: read_env_string("GIFT_DEVICECHECK_DEBUG_SECRET"),
             payout_command: read_env_string("GIFT_PAYOUT_COMMAND"),
             payout_timeout_ms: read_env_u64("GIFT_PAYOUT_TIMEOUT_MS", 30_000),
         }
@@ -117,6 +119,13 @@ impl GiftApiError {
     pub fn too_many_requests(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+        }
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
             message: message.into(),
         }
     }
@@ -176,6 +185,43 @@ pub struct GiftClaimResponse {
     pub tx_id: String,
     pub claim_id: String,
     pub amount_sompi: u64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GiftDeviceCheckDebugQueryRequest {
+    #[serde(alias = "device_token")]
+    pub device_token: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GiftDeviceCheckDebugQueryResponse {
+    pub bit0: bool,
+    pub device_token_sha256: String,
+    pub primary_host: String,
+    pub secondary_host: Option<String>,
+    pub environment: String,
+    pub timeout_ms: u64,
+    pub require_devicecheck: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GiftDeviceCheckDebugUpdateRequest {
+    #[serde(alias = "device_token")]
+    pub device_token: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GiftDeviceCheckDebugUpdateResponse {
+    pub bit0_after_update: bool,
+    pub updated: bool,
+    pub device_token_sha256: String,
+    pub primary_host: String,
+    pub secondary_host: Option<String>,
+    pub environment: String,
+    pub timeout_ms: u64,
+    pub require_devicecheck: bool,
 }
 
 #[derive(Clone)]
@@ -297,13 +343,18 @@ impl GiftService {
         }
 
         info!(
-            "Gift service initialized enabled={} claims={} amount_sompi={} require_appattest={} require_devicecheck={} simulator_claims={}",
+            "Gift service initialized enabled={} claims={} amount_sompi={} require_appattest={} require_devicecheck={} simulator_claims={} debug_devicecheck={}",
             config.enabled,
             claims.len(),
             config.amount_sompi,
             config.require_appattest,
             config.require_devicecheck,
-            config.allow_simulator_claims
+            config.allow_simulator_claims,
+            config
+                .devicecheck_debug_secret
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
         );
 
         Ok(Self {
@@ -343,6 +394,78 @@ impl GiftService {
         );
 
         Ok(response)
+    }
+
+    pub async fn debug_query_devicecheck_bit0(
+        &self,
+        request: GiftDeviceCheckDebugQueryRequest,
+        debug_secret_header: Option<&str>,
+    ) -> Result<GiftDeviceCheckDebugQueryResponse, GiftApiError> {
+        self.require_devicecheck_debug_authorization(debug_secret_header)?;
+
+        let normalized_device_token = request.device_token.trim();
+        if normalized_device_token.is_empty() {
+            return Err(GiftApiError::bad_request("missing device token"));
+        }
+
+        let token_bytes = validate_base64_blob(normalized_device_token, "invalid device token")?;
+        let token_fingerprint = sha256_hex(&token_bytes);
+
+        let client = self.require_devicecheck_client()?;
+        let bit0 = client
+            .query_bit0(normalized_device_token)
+            .await
+            .map_err(|error| GiftApiError::internal(format!("devicecheck query failed: {error}")))?;
+
+        Ok(GiftDeviceCheckDebugQueryResponse {
+            bit0,
+            device_token_sha256: token_fingerprint,
+            primary_host: client.host.clone(),
+            secondary_host: client.secondary_host.clone(),
+            environment: self.config.devicecheck_environment.clone(),
+            timeout_ms: self.config.devicecheck_timeout_ms,
+            require_devicecheck: self.config.require_devicecheck,
+        })
+    }
+
+    pub async fn debug_update_devicecheck_bit0(
+        &self,
+        request: GiftDeviceCheckDebugUpdateRequest,
+        debug_secret_header: Option<&str>,
+    ) -> Result<GiftDeviceCheckDebugUpdateResponse, GiftApiError> {
+        self.require_devicecheck_debug_authorization(debug_secret_header)?;
+
+        let normalized_device_token = request.device_token.trim();
+        if normalized_device_token.is_empty() {
+            return Err(GiftApiError::bad_request("missing device token"));
+        }
+
+        let token_bytes = validate_base64_blob(normalized_device_token, "invalid device token")?;
+        let token_fingerprint = sha256_hex(&token_bytes);
+
+        let client = self.require_devicecheck_client()?;
+        client
+            .update_bit0_true(normalized_device_token)
+            .await
+            .map_err(|error| GiftApiError::internal(format!("devicecheck update failed: {error}")))?;
+
+        let bit0_after_update = client
+            .query_bit0(normalized_device_token)
+            .await
+            .map_err(|error| {
+                GiftApiError::internal(format!("devicecheck query after update failed: {error}"))
+            })?;
+
+        Ok(GiftDeviceCheckDebugUpdateResponse {
+            bit0_after_update,
+            updated: true,
+            device_token_sha256: token_fingerprint,
+            primary_host: client.host.clone(),
+            secondary_host: client.secondary_host.clone(),
+            environment: self.config.devicecheck_environment.clone(),
+            timeout_ms: self.config.devicecheck_timeout_ms,
+            require_devicecheck: self.config.require_devicecheck,
+        })
     }
 
     pub async fn claim(
@@ -587,6 +710,34 @@ impl GiftService {
         self.devicecheck_client
             .as_deref()
             .ok_or_else(|| GiftApiError::service_unavailable("device verification is not configured"))
+    }
+
+    fn require_devicecheck_debug_authorization(
+        &self,
+        provided_secret: Option<&str>,
+    ) -> Result<(), GiftApiError> {
+        let configured_secret = self
+            .config
+            .devicecheck_debug_secret
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                GiftApiError::service_unavailable(
+                    "devicecheck debug endpoint is disabled (set GIFT_DEVICECHECK_DEBUG_SECRET)",
+                )
+            })?;
+
+        let provided_secret = provided_secret
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| GiftApiError::unauthorized("missing x-gift-debug-secret header"))?;
+
+        if provided_secret != configured_secret {
+            return Err(GiftApiError::unauthorized("invalid x-gift-debug-secret header"));
+        }
+
+        Ok(())
     }
 
     fn require_app_attest_verifier(&self) -> Result<&AppAttestVerifier, GiftApiError> {
@@ -859,13 +1010,20 @@ impl DeviceCheckClient {
             };
 
             if response.status().is_success() {
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("unknown")
+                    .to_string();
                 let body = response
                     .text()
                     .await
                     .context("failed to read DeviceCheck query response body")?;
                 let bit0 = parse_devicecheck_query_bit0(&body).with_context(|| {
                     format!(
-                        "failed to decode DeviceCheck query response body={}",
+                        "failed to decode DeviceCheck query response content_type={} body={}",
+                        content_type,
                         summarize_devicecheck_body_for_log(&body)
                     )
                 })?;
@@ -1228,32 +1386,101 @@ fn parse_devicecheck_reason(body: &str) -> Option<String> {
 }
 
 fn parse_devicecheck_query_bit0(body: &str) -> anyhow::Result<bool> {
-    let payload: serde_json::Value =
-        serde_json::from_str(body).context("DeviceCheck query response is not valid JSON")?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("DeviceCheck query response is empty");
+    }
 
+    if let Ok(payload) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return parse_devicecheck_bit0_from_json_value(&payload);
+    }
+
+    if let Some(json_body) = extract_first_json_object(trimmed) {
+        if let Ok(payload) = serde_json::from_str::<serde_json::Value>(json_body) {
+            return parse_devicecheck_bit0_from_json_value(&payload);
+        }
+    }
+
+    if let Some(extracted_bit0) = extract_bit0_from_text(trimmed) {
+        return Ok(extracted_bit0);
+    }
+
+    anyhow::bail!("DeviceCheck query response is not parseable")
+}
+
+fn parse_devicecheck_bit0_from_json_value(payload: &serde_json::Value) -> anyhow::Result<bool> {
     match payload.get("bit0") {
         None | Some(serde_json::Value::Null) => Ok(false),
         Some(serde_json::Value::Bool(value)) => Ok(*value),
-        Some(serde_json::Value::Number(value)) => match value.as_i64() {
-            Some(0) => Ok(false),
-            Some(1) => Ok(true),
-            Some(other) => anyhow::bail!("DeviceCheck bit0 number must be 0 or 1, got {other}"),
-            None => anyhow::bail!("DeviceCheck bit0 number is out of range"),
-        },
-        Some(serde_json::Value::String(value)) => {
-            match value.trim().to_ascii_lowercase().as_str() {
-                "0" | "false" => Ok(false),
-                "1" | "true" => Ok(true),
-                other => anyhow::bail!(
-                    "DeviceCheck bit0 string must be true/false/0/1, got {other}"
-                ),
-            }
-        }
+        Some(serde_json::Value::Number(value)) => parse_devicecheck_bit0_number(value),
+        Some(serde_json::Value::String(value)) => parse_devicecheck_bit0_token(value.trim()),
         Some(value) => anyhow::bail!(
             "DeviceCheck bit0 has unsupported JSON type {}",
             devicecheck_json_type(value)
         ),
     }
+}
+
+fn parse_devicecheck_bit0_number(value: &serde_json::Number) -> anyhow::Result<bool> {
+    if let Some(integer) = value.as_i64() {
+        return match integer {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => anyhow::bail!("DeviceCheck bit0 number must be 0 or 1, got {other}"),
+        };
+    }
+
+    if let Some(float_value) = value.as_f64() {
+        if (float_value - 0.0).abs() < f64::EPSILON {
+            return Ok(false);
+        }
+        if (float_value - 1.0).abs() < f64::EPSILON {
+            return Ok(true);
+        }
+        anyhow::bail!("DeviceCheck bit0 float number must be 0 or 1, got {float_value}");
+    }
+
+    anyhow::bail!("DeviceCheck bit0 number is out of range")
+}
+
+fn parse_devicecheck_bit0_token(token: &str) -> anyhow::Result<bool> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" => Ok(false),
+        "1" | "true" => Ok(true),
+        "0.0" => Ok(false),
+        "1.0" => Ok(true),
+        other => anyhow::bail!("DeviceCheck bit0 token must be true/false/0/1, got {other}"),
+    }
+}
+
+fn extract_first_json_object(body: &str) -> Option<&str> {
+    let start = body.find('{')?;
+    let end = body.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    body.get(start..=end)
+}
+
+fn extract_bit0_from_text(body: &str) -> Option<bool> {
+    let lowercased = body.to_ascii_lowercase();
+    let bit0_position = lowercased.find("bit0")?;
+    let after_key = lowercased.get(bit0_position + "bit0".len()..)?.trim_start();
+    let after_separator = if let Some(remaining) = after_key.strip_prefix(':') {
+        remaining
+    } else if let Some(remaining) = after_key.strip_prefix('=') {
+        remaining
+    } else {
+        return None;
+    };
+    let token = after_separator
+        .trim_start()
+        .trim_matches(|character: char| character == '"' || character == '\'')
+        .split(|character: char| {
+            character.is_whitespace() || character == ',' || character == '}' || character == ']'
+        })
+        .next()?;
+    parse_devicecheck_bit0_token(token).ok()
 }
 
 fn devicecheck_json_type(value: &serde_json::Value) -> &'static str {
@@ -1376,4 +1603,54 @@ async fn persist_claims(path: &Path, values: Vec<GiftClaimRecord>) -> anyhow::Re
 
     std::fs::write(path, encoded)
         .with_context(|| format!("failed to write gift claims to {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_devicecheck_query_bit0;
+
+    #[test]
+    fn parse_devicecheck_query_bit0_accepts_standard_json_shapes() {
+        assert_eq!(
+            parse_devicecheck_query_bit0(r#"{"bit0": true, "bit1": false}"#).unwrap(),
+            true
+        );
+        assert_eq!(
+            parse_devicecheck_query_bit0(r#"{"bit0": 0, "bit1": 1}"#).unwrap(),
+            false
+        );
+        assert_eq!(
+            parse_devicecheck_query_bit0(r#"{"bit0": "1", "bit1": "0"}"#).unwrap(),
+            true
+        );
+        assert_eq!(
+            parse_devicecheck_query_bit0(r#"{"bit0": 1.0, "bit1": 0.0}"#).unwrap(),
+            true
+        );
+    }
+
+    #[test]
+    fn parse_devicecheck_query_bit0_accepts_wrapped_json_body() {
+        assert_eq!(
+            parse_devicecheck_query_bit0(
+                "proxy-prefix<<<{\"bit0\": \"false\", \"bit1\": \"true\"}>>>proxy-suffix"
+            )
+            .unwrap(),
+            false
+        );
+    }
+
+    #[test]
+    fn parse_devicecheck_query_bit0_accepts_plain_text_fallback() {
+        assert_eq!(
+            parse_devicecheck_query_bit0("bit0=1 bit1=0 last_update_time=2026-03-10").unwrap(),
+            true
+        );
+    }
+
+    #[test]
+    fn parse_devicecheck_query_bit0_rejects_unparseable_body() {
+        let result = parse_devicecheck_query_bit0("apple returned something unexpected");
+        assert!(result.is_err());
+    }
 }

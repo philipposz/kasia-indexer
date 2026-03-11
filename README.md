@@ -85,6 +85,42 @@ docker compose ps
 docker compose logs -f kasia-indexer
 ```
 
+### DeviceCheck debug endpoints (admin-only)
+
+Set in `.env`:
+
+```bash
+GIFT_DEVICECHECK_DEBUG_SECRET=<your_secret>
+```
+
+Then call:
+
+```bash
+# Query bit0
+curl -sS -X POST "http://127.0.0.1:8080/v1/gift/debug/query-bit0" \
+  -H "Content-Type: application/json" \
+  -H "x-gift-debug-secret: ${GIFT_DEVICECHECK_DEBUG_SECRET}" \
+  --data '{"deviceToken":"<BASE64_DEVICE_TOKEN>"}'
+
+# Update bit0=true and verify
+curl -sS -X POST "http://127.0.0.1:8080/v1/gift/debug/update-bit0" \
+  -H "Content-Type: application/json" \
+  -H "x-gift-debug-secret: ${GIFT_DEVICECHECK_DEBUG_SECRET}" \
+  --data '{"deviceToken":"<BASE64_DEVICE_TOKEN>"}'
+```
+
+Helper script:
+
+```bash
+INDEXER_BASE_URL=http://127.0.0.1:8080 \
+GIFT_DEVICECHECK_DEBUG_SECRET=<your_secret> \
+./scripts/devicecheck_query_bit0.sh --action query --token-file /tmp/device_token.txt
+
+INDEXER_BASE_URL=http://127.0.0.1:8080 \
+GIFT_DEVICECHECK_DEBUG_SECRET=<your_secret> \
+./scripts/devicecheck_query_bit0.sh --action update --token-file /tmp/device_token.txt
+```
+
 ## API
 
 - http://localhost:8080/swagger-ui/

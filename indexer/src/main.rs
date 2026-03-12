@@ -22,7 +22,9 @@ use indexer_db::messages::handshake::{
 use indexer_db::messages::payment::{
     PaymentByReceiverPartition, PaymentBySenderPartition, TxIdToPaymentPartition,
 };
-use indexer_db::messages::self_stash::{SelfStashByOwnerPartition, TxIdToSelfStashPartition};
+use indexer_db::messages::self_stash::{
+    SelfStashByOwnerPartition, SelfStashByScopePartition, TxIdToSelfStashPartition,
+};
 use indexer_db::metadata::MetadataPartition;
 use indexer_db::migration::apply_migrations;
 use indexer_db::processing::accepting_block_to_txs::AcceptingBlockToTxIDPartition;
@@ -83,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
     let payment_by_receiver_partition = PaymentByReceiverPartition::new(&tx_keyspace)?;
     let tx_id_to_payment_partition = TxIdToPaymentPartition::new(&tx_keyspace)?;
     let self_stash_by_owner_partition = SelfStashByOwnerPartition::new(&tx_keyspace)?;
+    let self_stash_by_scope_partition = SelfStashByScopePartition::new(&tx_keyspace)?;
     let tx_id_to_self_stash_partition = TxIdToSelfStashPartition::new(&tx_keyspace)?;
     let tx_id_to_acceptance_partition = TxIDToAcceptancePartition::new(&tx_keyspace)?;
     let block_compact_header_partition = BlockCompactHeaderPartition::new(&tx_keyspace)?;
@@ -156,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
         .payment_by_receiver_partition(payment_by_receiver_partition.clone())
         .payment_by_sender_partition(payment_by_sender_partition.clone())
         .self_stash_by_owner_partition(self_stash_by_owner_partition.clone())
+        .self_stash_by_scope_partition(self_stash_by_scope_partition.clone())
         .tx_id_to_self_stash_partition(tx_id_to_self_stash_partition.clone())
         .tx_id_to_payment_partition(tx_id_to_payment_partition.clone())
         .tx_id_to_acceptance_partition(tx_id_to_acceptance_partition.clone())
@@ -180,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
         .payment_by_receiver_partition(payment_by_receiver_partition.clone())
         .payment_by_sender_partition(payment_by_sender_partition.clone())
         .self_stash_by_owner_partition(self_stash_by_owner_partition.clone())
+        .self_stash_by_scope_partition(self_stash_by_scope_partition.clone())
         .metrics(metrics.clone())
         .runtime(tokio::runtime::Handle::current())
         .build();
@@ -258,6 +263,7 @@ async fn main() -> anyhow::Result<()> {
         tx_id_to_handshake_partition,
         tx_id_to_payment_partition,
         self_stash_by_owner_partition,
+        self_stash_by_scope_partition,
         tx_id_to_self_stash_partition,
         gift_api,
         push_api,

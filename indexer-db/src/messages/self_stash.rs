@@ -92,6 +92,60 @@ impl SelfStashByOwnerPartition {
     }
 }
 
+/// scope (255) + block_time (8) + owner (34) + block_hash (32) + version (1) + tx_id (32)
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Immutable, KnownLayout, IntoBytes, FromBytes, Unaligned,
+)]
+#[repr(C)]
+pub struct SelfStashKeyByScope {
+    pub scope: SelfStashScope,
+    pub block_time: U64,
+    pub owner: AddressPayload,
+    pub block_hash: [u8; 32],
+    pub version: u8,
+    pub tx_id: [u8; 32],
+}
+
+#[derive(Clone)]
+pub struct SelfStashByScopePartition(fjall::TxPartition);
+
+impl SelfStashByScopePartition {
+    pub fn new(keyspace: &fjall::TxKeyspace) -> anyhow::Result<Self> {
+        Ok(Self(keyspace.open_partition(
+            "self_stash_by_scope",
+            PartitionCreateOptions::default(),
+        )?))
+    }
+
+    pub fn insert_wtx(&self, wtx: &mut WriteTransaction, key: &SelfStashKeyByScope) {
+        wtx.insert(&self.0, key.as_bytes(), []);
+    }
+
+    pub fn iter_by_scope_from_block_time_rtx(
+        &self,
+        rtx: &ReadTransaction,
+        scope: &[u8],
+        block_time: u64,
+    ) -> impl DoubleEndedIterator<Item = Result<SharedImmutable<SelfStashKeyByScope>>> + '_ {
+        const BLOCK_TIME_OFFSET: usize = offset_of!(SelfStashKeyByScope, block_time);
+        const PREFIX_LEN: usize = BLOCK_TIME_OFFSET + size_of::<U64>();
+
+        let scope_bytes = SelfStashScope::from(scope);
+
+        let mut range_start = [0u8; PREFIX_LEN];
+        range_start[..SCOPE_LEN].copy_from_slice(scope_bytes.as_bytes());
+        range_start[BLOCK_TIME_OFFSET..PREFIX_LEN].copy_from_slice(&block_time.to_be_bytes());
+
+        let mut range_end = [0xFFu8; PREFIX_LEN];
+        range_end[..SCOPE_LEN].copy_from_slice(scope_bytes.as_bytes());
+
+        rtx.range(&self.0, range_start..=range_end).map(|item| {
+            let (key_bytes, _value_bytes) = item?;
+            Ok(SharedImmutable::new(key_bytes))
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct TxIdToSelfStashPartition(fjall::TxPartition);
 

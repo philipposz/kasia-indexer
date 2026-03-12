@@ -19,7 +19,9 @@ use indexer_db::messages::handshake::{
 use indexer_db::messages::payment::{
     PaymentByReceiverPartition, PaymentBySenderPartition, TxIdToPaymentPartition,
 };
-use indexer_db::messages::self_stash::{SelfStashByOwnerPartition, TxIdToSelfStashPartition};
+use indexer_db::messages::self_stash::{
+    SelfStashByOwnerPartition, SelfStashByScopePartition, TxIdToSelfStashPartition,
+};
 use indexer_db::processing::tx_id_to_acceptance::TxIDToAcceptancePartition;
 use std::net::SocketAddr;
 use tower_http::cors::CorsLayer;
@@ -50,6 +52,7 @@ pub mod self_stash;
         push::update_device,
         push::unregister_device,
         self_stash::get_self_stash_by_owner,
+        self_stash::get_self_stash_by_scope,
         get_metrics,
     ),
     components(
@@ -86,6 +89,7 @@ impl Api {
         tx_id_to_handshake_partition: TxIdToHandshakePartition,
         tx_id_to_payment_partition: TxIdToPaymentPartition,
         self_stash_by_owner_partition: SelfStashByOwnerPartition,
+        self_stash_by_scope_partition: SelfStashByScopePartition,
         tx_id_to_self_stash_partition: TxIdToSelfStashPartition,
         gift_api: GiftApi,
         push_api: PushApi,
@@ -121,6 +125,7 @@ impl Api {
         let self_stash_api = SelfStashApi::new(
             tx_keyspace,
             self_stash_by_owner_partition,
+            self_stash_by_scope_partition,
             tx_id_to_acceptance_partition,
             tx_id_to_self_stash_partition,
             context,

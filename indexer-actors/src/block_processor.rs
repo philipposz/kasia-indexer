@@ -23,7 +23,8 @@ use indexer_db::messages::payment::{
     TxIdToPaymentPartition,
 };
 use indexer_db::messages::self_stash::{
-    SelfStashByOwnerPartition, SelfStashKeyByOwner, SelfStashScope, TxIdToSelfStashPartition,
+    SelfStashByOwnerPartition, SelfStashByScopePartition, SelfStashKeyByOwner,
+    SelfStashKeyByScope, SelfStashScope, TxIdToSelfStashPartition,
 };
 use indexer_db::metadata::MetadataPartition;
 use indexer_db::processing::tx_id_to_acceptance::{
@@ -62,6 +63,7 @@ pub struct BlockProcessor {
     tx_id_to_contextual_message_partition: TxIdToContextualMessagePartition,
     tx_id_to_self_stash_partition: TxIdToSelfStashPartition,
     self_stash_by_owner_partition: SelfStashByOwnerPartition,
+    self_stash_by_scope_partition: SelfStashByScopePartition,
     payment_by_receiver_partition: PaymentByReceiverPartition,
     payment_by_sender_partition: PaymentBySenderPartition,
     tx_id_to_payment_partition: TxIdToPaymentPartition,
@@ -744,21 +746,37 @@ impl BlockProcessor {
     ) {
         self.tx_id_to_self_stash_partition
             .insert_wtx(wtx, tx_id.as_ref(), sss.sealed_hex);
+        let scope = SelfStashScope::from(sss.key.unwrap_or_default());
         let key = SelfStashKeyByOwner {
             owner: sender.unwrap_or_default(),
-            scope: SelfStashScope::from(sss.key.unwrap_or_default()),
+            scope,
             block_time: block_header.timestamp.into(),
+            block_hash: block_header.hash.as_bytes(),
+            version: 1,
+            tx_id: tx_id.as_bytes(),
+        };
+        let key_by_scope = SelfStashKeyByScope {
+            scope,
+            block_time: block_header.timestamp.into(),
+            owner: sender.unwrap_or_default(),
             block_hash: block_header.hash.as_bytes(),
             version: 1,
             tx_id: tx_id.as_bytes(),
         };
         if sender.is_some() {
             self.self_stash_by_owner_partition.insert_wtx(wtx, &key);
+            self.self_stash_by_scope_partition
+                .insert_wtx(wtx, &key_by_scope);
         } else {
             entries.push(InsertionEntry {
                 partition_id: PartitionId::SelfStashByOwner,
                 action: Action::InsertByKeySender,
                 partition_key: SmallVec::from_slice(key.as_bytes()),
+            });
+            entries.push(InsertionEntry {
+                partition_id: PartitionId::SelfStashByScope,
+                action: Action::InsertByKeySender,
+                partition_key: SmallVec::from_slice(key_by_scope.as_bytes()),
             });
         }
     }

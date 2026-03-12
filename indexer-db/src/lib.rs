@@ -148,4 +148,5 @@ pub enum PartitionId {
     PendingSenders = 14,
     SelfStashByOwner = 15,
     TxIDToSelfStash = 16,
+    SelfStashByScope = 17,
 }

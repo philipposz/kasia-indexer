@@ -15,7 +15,10 @@ use indexer_db::messages::handshake::{
 use indexer_db::messages::payment::{
     PaymentByReceiverPartition, PaymentBySenderPartition, PaymentKeyByReceiver, PaymentKeyBySender,
 };
-use indexer_db::messages::self_stash::{SelfStashByOwnerPartition, SelfStashKeyByOwner};
+use indexer_db::messages::self_stash::{
+    SelfStashByOwnerPartition, SelfStashByScopePartition, SelfStashKeyByOwner,
+    SelfStashKeyByScope,
+};
 use indexer_db::metadata::{Cursor as DbCursor, MetadataPartition};
 use indexer_db::processing::accepting_block_to_txs::AcceptingBlockToTxIDPartition;
 use indexer_db::processing::pending_senders::{
@@ -57,6 +60,7 @@ pub struct VirtualProcessor {
 
     contextual_message_by_sender_partition: ContextualMessageBySenderPartition,
     self_stash_by_owner_partition: SelfStashByOwnerPartition,
+    self_stash_by_scope_partition: SelfStashByScopePartition,
 
     payment_by_receiver_partition: PaymentByReceiverPartition,
     payment_by_sender_partition: PaymentBySenderPartition,
@@ -770,6 +774,7 @@ impl VirtualProcessor {
                     PartitionId::PaymentByReceiver => size_of::<PaymentKeyByReceiver>(),
                     PartitionId::PaymentBySender => size_of::<PaymentKeyBySender>(),
                     PartitionId::SelfStashByOwner => size_of::<SelfStashKeyByOwner>(),
+                    PartitionId::SelfStashByScope => size_of::<SelfStashKeyByScope>(),
                 },
                 |wtx, entry| match entry.partition_id {
                     PartitionId::Metadata
@@ -846,6 +851,16 @@ impl VirtualProcessor {
                             .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
                         key.owner = sender;
                         self.self_stash_by_owner_partition.insert_wtx(wtx, &key);
+                        Ok(())
+                    }
+                    PartitionId::SelfStashByScope => {
+                        if !matches!(entry.action, Action::InsertByKeySender) {
+                            panic!("Unexpected action")
+                        }
+                        let mut key = SelfStashKeyByScope::try_read_from_bytes(entry.key)
+                            .map_err(|_| anyhow::anyhow!("Key conversion error"))?;
+                        key.owner = sender;
+                        self.self_stash_by_scope_partition.insert_wtx(wtx, &key);
                         Ok(())
                     }
                 },

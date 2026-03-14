@@ -465,7 +465,7 @@ impl PushService {
             self.dispatch_counters.attempts.fetch_add(1, Ordering::Relaxed);
 
             match apns_client
-                .send_notification(&registration.device_token, &payload)
+                .send_notification(&registration.device_token, &payload, event.message_type)
                 .await
             {
                 Ok(ApnsSendOutcome::Sent) => {
@@ -911,16 +911,22 @@ impl ApnsClient {
         &self,
         device_token: &str,
         payload: &Value,
+        message_type: PushMessageType,
     ) -> anyhow::Result<ApnsSendOutcome> {
         let auth_token = self.auth_token().await?;
         let url = format!("{}/3/device/{}", self.host, device_token);
+        let (apns_push_type, apns_priority) = match message_type {
+            PushMessageType::Contextual => ("background", "5"),
+            PushMessageType::Handshake | PushMessageType::Payment => ("alert", "10"),
+        };
 
         let response = self
             .client
             .post(url)
             .header("authorization", format!("bearer {auth_token}"))
             .header("apns-topic", &self.topic)
-            .header("apns-push-type", "alert")
+            .header("apns-push-type", apns_push_type)
+            .header("apns-priority", apns_priority)
             .json(payload)
             .send()
             .await

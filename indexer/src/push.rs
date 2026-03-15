@@ -420,30 +420,35 @@ impl PushService {
             .filter(|payload| payload.len() <= self.config.apns_inline_payload_limit);
 
         let mut body = serde_json::Map::new();
-        if matches!(event.message_type, PushMessageType::Contextual) {
-            body.insert(
-                "aps".to_string(),
-                json!({
-                    "mutable-content": 1,
-                    "content-available": 1
-                }),
-            );
-        } else {
-            body.insert(
-                "aps".to_string(),
-                json!({
-                    "alert": {
-                        "title": "KBeam",
-                        "body": match event.message_type {
-                            PushMessageType::Payment => "Received payment",
-                            PushMessageType::Handshake => "Started a conversation",
-                            PushMessageType::Contextual => " ",
-                        }
-                    },
-                    "mutable-content": 1,
-                    "content-available": 1
-                }),
-            );
+        body.insert(
+            "aps".to_string(),
+            json!({
+                "alert": {
+                    "title": "KBeam",
+                    "body": match event.message_type {
+                        PushMessageType::Payment => "Received payment",
+                        PushMessageType::Handshake => "Started a conversation",
+                        // Contextual payload text is rendered by the iOS notification service extension.
+                        // Keep backend fallback neutral to avoid leaking control-payload noise if extension processing fails.
+                        PushMessageType::Contextual => " ",
+                    }
+                },
+                "mutable-content": 1,
+                "content-available": 1
+            }),
+        );
+        body.insert("tx_id".to_string(), json!(tx_id));
+        body.insert("sender".to_string(), json!(sender_address));
+        body.insert(
+            "type".to_string(),
+            json!(push_message_type_tag(event.message_type)),
+        );
+        body.insert("timestamp".to_string(), json!(event.timestamp));
+        if let Some(amount) = event.amount {
+            body.insert("amount".to_string(), json!(amount));
+        }
+        if let Some(payload) = payload_hex {
+            body.insert("payload".to_string(), json!(payload));
         }
         let payload = Value::Object(body);
 
@@ -915,9 +920,13 @@ impl ApnsClient {
     ) -> anyhow::Result<ApnsSendOutcome> {
         let auth_token = self.auth_token().await?;
         let url = format!("{}/3/device/{}", self.host, device_token);
-        let (apns_push_type, apns_priority) = match message_type {
-            PushMessageType::Contextual => ("background", "5"),
-            PushMessageType::Handshake | PushMessageType::Payment => ("alert", "10"),
+        let has_alert = payload
+            .get("aps")
+            .and_then(|aps| aps.get("alert"))
+            .is_some();
+        let (apns_push_type, apns_priority) = match (message_type, has_alert) {
+            (PushMessageType::Contextual, false) => ("background", "5"),
+            _ => ("alert", "10"),
         };
 
         let response = self

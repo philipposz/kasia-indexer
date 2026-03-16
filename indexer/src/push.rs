@@ -18,6 +18,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 const PUSH_SUPPRESSED_ALIAS_SUFFIX: &str = "__silent";
+const PUSH_VISIBLE_ALIAS_SUFFIX: &str = "__push";
 
 #[derive(Clone)]
 pub struct PushService {
@@ -404,6 +405,20 @@ impl PushService {
                 sender = %sender_address,
                 alias = %contextual_alias.unwrap_or_default(),
                 "Skipping push dispatch for push-suppressed contextual alias"
+            );
+            return Ok(());
+        }
+
+        if matches!(event.message_type, PushMessageType::Contextual)
+            && !contextual_alias
+                .as_deref()
+                .is_some_and(is_push_visible_alias)
+        {
+            debug!(
+                tx_id = %faster_hex::hex_string(&event.tx_id),
+                sender = %sender_address,
+                alias = %contextual_alias.unwrap_or_default(),
+                "Skipping contextual push dispatch due to missing explicit push alias policy"
             );
             return Ok(());
         }
@@ -1091,6 +1106,12 @@ fn is_push_suppressed_alias(alias: &str) -> bool {
     alias
         .trim()
         .ends_with(PUSH_SUPPRESSED_ALIAS_SUFFIX)
+}
+
+fn is_push_visible_alias(alias: &str) -> bool {
+    alias
+        .trim()
+        .ends_with(PUSH_VISIBLE_ALIAS_SUFFIX)
 }
 
 fn normalize_optional_address(value: Option<&str>) -> Option<String> {

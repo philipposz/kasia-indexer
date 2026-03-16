@@ -575,9 +575,17 @@ impl PushService {
                 }
             })
             .filter(|registration| match message_type {
-                PushMessageType::Contextual
-                | PushMessageType::Handshake
-                | PushMessageType::Payment => {
+                PushMessageType::Contextual => {
+                    let Some(receiver) = receiver_address else {
+                        return false;
+                    };
+                    registration
+                        .primary_address
+                        .as_deref()
+                        .is_some_and(|value| value == receiver)
+                        || registration.wallet_address == receiver
+                }
+                PushMessageType::Handshake | PushMessageType::Payment => {
                     let Some(receiver) = receiver_address else {
                         return false;
                     };

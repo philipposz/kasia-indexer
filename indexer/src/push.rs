@@ -384,6 +384,17 @@ impl PushService {
             None
         };
 
+        if matches!(event.message_type, PushMessageType::Contextual)
+            && (receiver_address.is_none() || contextual_alias.as_deref().is_none())
+        {
+            debug!(
+                tx_id = %faster_hex::hex_string(&event.tx_id),
+                sender = %sender_address,
+                "Skipping contextual push dispatch due to missing receiver or alias"
+            );
+            return Ok(());
+        }
+
         if contextual_alias
             .as_deref()
             .is_some_and(is_push_suppressed_alias)
@@ -543,7 +554,7 @@ impl PushService {
     async fn matching_registrations(
         &self,
         message_type: PushMessageType,
-        sender_address: &str,
+        _sender_address: &str,
         receiver_address: Option<&str>,
     ) -> Vec<DeviceRegistration> {
         let registrations = self.registrations.read().await;
@@ -564,8 +575,9 @@ impl PushService {
                 }
             })
             .filter(|registration| match message_type {
-                PushMessageType::Contextual => registration.watched_addresses.contains(sender_address),
-                PushMessageType::Handshake | PushMessageType::Payment => {
+                PushMessageType::Contextual
+                | PushMessageType::Handshake
+                | PushMessageType::Payment => {
                     let Some(receiver) = receiver_address else {
                         return false;
                     };

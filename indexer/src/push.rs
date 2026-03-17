@@ -646,7 +646,6 @@ impl PushService {
                         .as_deref()
                         .is_some_and(|value| value == receiver)
                         || registration.wallet_address == receiver
-                        || registration.watched_addresses.contains(receiver)
                 }
             })
             .cloned()

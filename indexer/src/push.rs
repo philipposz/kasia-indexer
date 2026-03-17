@@ -401,12 +401,12 @@ impl PushService {
         };
 
         if matches!(event.message_type, PushMessageType::Contextual)
-            && (receiver_address.is_none() || contextual_alias.as_deref().is_none())
+            && contextual_alias.as_deref().is_none()
         {
             debug!(
                 tx_id = %faster_hex::hex_string(&event.tx_id),
                 sender = %sender_address,
-                "Skipping contextual push dispatch due to missing receiver or alias"
+                "Skipping contextual push dispatch due to missing alias"
             );
             return Ok(());
         }
@@ -467,6 +467,7 @@ impl PushService {
                 event.message_type,
                 &sender_address,
                 receiver_address.as_deref(),
+                contextual_alias.as_deref(),
             )
             .await;
         self.dispatch_counters
@@ -610,6 +611,7 @@ impl PushService {
         message_type: PushMessageType,
         _sender_address: &str,
         receiver_address: Option<&str>,
+        contextual_alias: Option<&str>,
     ) -> Vec<DeviceRegistration> {
         let registrations = self.registrations.read().await;
         let configured_bundle_id = self
@@ -630,14 +632,10 @@ impl PushService {
             })
             .filter(|registration| match message_type {
                 PushMessageType::Contextual => {
-                    let Some(receiver) = receiver_address else {
+                    let Some(alias) = contextual_alias else {
                         return false;
                     };
-                    registration
-                        .primary_address
-                        .as_deref()
-                        .is_some_and(|value| value == receiver)
-                        || registration.wallet_address == receiver
+                    registration.aliases.iter().any(|value| value == alias)
                 }
                 PushMessageType::Handshake | PushMessageType::Payment => {
                     let Some(receiver) = receiver_address else {

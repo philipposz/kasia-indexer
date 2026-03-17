@@ -57,6 +57,12 @@ The default `docker-compose.yaml` is configured for an iOS-first push profile:
 cp .env.example .env
 ```
 
+Run deploy preflight checks (required keys, basic formats, mounted key files):
+
+```bash
+./scripts/check-env.sh --env-file .env
+```
+
 Set at minimum:
 
 - `KASPA_NODE_WBORSH_URL`

@@ -17,8 +17,23 @@ use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-const PUSH_SUPPRESSED_ALIAS_SUFFIX: &str = "__silent";
-const PUSH_VISIBLE_ALIAS_SUFFIX: &str = "__push";
+const PUSH_SUPPRESSED_ALIAS_SUFFIX: &str = "__kbs1";
+const PUSH_VISIBLE_ALIAS_SUFFIX: &str = "__kbp1";
+const LEGACY_PUSH_SUPPRESSED_ALIAS_SUFFIX: &str = "__silent";
+const LEGACY_PUSH_VISIBLE_ALIAS_SUFFIX: &str = "__push";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextualAliasPolicy {
+    Visible,
+    Silent,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContextualUnknownPolicy {
+    Drop,
+    Visible,
+}
 
 #[derive(Clone)]
 pub struct PushService {
@@ -396,31 +411,55 @@ impl PushService {
             return Ok(());
         }
 
-        if contextual_alias
-            .as_deref()
-            .is_some_and(is_push_suppressed_alias)
-        {
-            debug!(
-                tx_id = %faster_hex::hex_string(&event.tx_id),
-                sender = %sender_address,
-                alias = %contextual_alias.unwrap_or_default(),
-                "Skipping push dispatch for push-suppressed contextual alias"
-            );
-            return Ok(());
-        }
-
-        if matches!(event.message_type, PushMessageType::Contextual)
-            && !contextual_alias
+        if matches!(event.message_type, PushMessageType::Contextual) {
+            let alias_mode = parse_contextual_alias_mode();
+            let allow_legacy_suffix = read_env_bool("PUSH_CONTEXTUAL_ALLOW_LEGACY_SUFFIX", false);
+            let unknown_policy = parse_contextual_unknown_policy();
+            let alias_policy = contextual_alias
                 .as_deref()
-                .is_some_and(is_push_visible_alias)
-        {
+                .map(|alias| parse_contextual_alias_policy(alias, allow_legacy_suffix))
+                .unwrap_or(ContextualAliasPolicy::Unknown);
+
             debug!(
                 tx_id = %faster_hex::hex_string(&event.tx_id),
                 sender = %sender_address,
-                alias = %contextual_alias.unwrap_or_default(),
-                "Skipping contextual push dispatch due to missing explicit push alias policy"
+                alias = %contextual_alias.as_deref().unwrap_or_default(),
+                alias_mode,
+                alias_policy = %contextual_alias_policy_tag(alias_policy),
+                unknown_policy = %contextual_unknown_policy_tag(unknown_policy),
+                allow_legacy_suffix,
+                "Decoded contextual alias policy"
             );
-            return Ok(());
+
+            match alias_policy {
+                ContextualAliasPolicy::Silent => {
+                    debug!(
+                        tx_id = %faster_hex::hex_string(&event.tx_id),
+                        sender = %sender_address,
+                        alias = %contextual_alias.as_deref().unwrap_or_default(),
+                        "Skipping push dispatch for push-suppressed contextual alias"
+                    );
+                    return Ok(());
+                }
+                ContextualAliasPolicy::Visible => {}
+                ContextualAliasPolicy::Unknown => {
+                    if matches!(unknown_policy, ContextualUnknownPolicy::Drop) {
+                        debug!(
+                            tx_id = %faster_hex::hex_string(&event.tx_id),
+                            sender = %sender_address,
+                            alias = %contextual_alias.as_deref().unwrap_or_default(),
+                            "Skipping contextual push dispatch due to unknown alias policy"
+                        );
+                        return Ok(());
+                    }
+                    debug!(
+                        tx_id = %faster_hex::hex_string(&event.tx_id),
+                        sender = %sender_address,
+                        alias = %contextual_alias.as_deref().unwrap_or_default(),
+                        "Allowing contextual push dispatch due to unknown-policy override"
+                    );
+                }
+            }
         }
 
         let targets = self
@@ -1102,16 +1141,59 @@ fn extract_contextual_alias(payload: &[u8]) -> Option<String> {
     Some(alias.to_string())
 }
 
-fn is_push_suppressed_alias(alias: &str) -> bool {
-    alias
-        .trim()
-        .ends_with(PUSH_SUPPRESSED_ALIAS_SUFFIX)
+fn parse_contextual_alias_policy(alias: &str, allow_legacy_suffix: bool) -> ContextualAliasPolicy {
+    let normalized = alias.trim();
+
+    if normalized.ends_with(PUSH_SUPPRESSED_ALIAS_SUFFIX) {
+        return ContextualAliasPolicy::Silent;
+    }
+    if normalized.ends_with(PUSH_VISIBLE_ALIAS_SUFFIX) {
+        return ContextualAliasPolicy::Visible;
+    }
+
+    if allow_legacy_suffix {
+        if normalized.ends_with(LEGACY_PUSH_SUPPRESSED_ALIAS_SUFFIX) {
+            return ContextualAliasPolicy::Silent;
+        }
+        if normalized.ends_with(LEGACY_PUSH_VISIBLE_ALIAS_SUFFIX) {
+            return ContextualAliasPolicy::Visible;
+        }
+    }
+
+    ContextualAliasPolicy::Unknown
 }
 
-fn is_push_visible_alias(alias: &str) -> bool {
-    alias
-        .trim()
-        .ends_with(PUSH_VISIBLE_ALIAS_SUFFIX)
+fn parse_contextual_unknown_policy() -> ContextualUnknownPolicy {
+    let value = read_env_string("PUSH_CONTEXTUAL_UNKNOWN_POLICY")
+        .unwrap_or_else(|| "drop".to_string());
+    match value.trim().to_lowercase().as_str() {
+        "visible" => ContextualUnknownPolicy::Visible,
+        _ => ContextualUnknownPolicy::Drop,
+    }
+}
+
+fn parse_contextual_alias_mode() -> &'static str {
+    let value = read_env_string("PUSH_CONTEXTUAL_ALIAS_MODE")
+        .unwrap_or_else(|| "strict".to_string());
+    match value.trim().to_lowercase().as_str() {
+        "strict" => "strict",
+        _ => "strict",
+    }
+}
+
+fn contextual_unknown_policy_tag(policy: ContextualUnknownPolicy) -> &'static str {
+    match policy {
+        ContextualUnknownPolicy::Drop => "drop",
+        ContextualUnknownPolicy::Visible => "visible",
+    }
+}
+
+fn contextual_alias_policy_tag(policy: ContextualAliasPolicy) -> &'static str {
+    match policy {
+        ContextualAliasPolicy::Visible => "visible",
+        ContextualAliasPolicy::Silent => "silent",
+        ContextualAliasPolicy::Unknown => "unknown",
+    }
 }
 
 fn normalize_optional_address(value: Option<&str>) -> Option<String> {

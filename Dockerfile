@@ -10,7 +10,7 @@ RUN cargo build --release -p indexer
 
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates tzdata openssh-client \
     && addgroup -S indexer \
     && adduser -S -G indexer indexer
 

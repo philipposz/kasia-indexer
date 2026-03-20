@@ -52,6 +52,8 @@ services:
       - indexer-data:/data
       - ./secrets/apns:/app/secrets/apns:ro
       - ./secrets/devicecheck:/app/secrets/devicecheck:ro
+      - ./secrets/ssh:/app/secrets/ssh:ro
+      - ./secrets/gift:/app/secrets/gift:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/metrics >/dev/null || exit 1"]
       interval: 30s

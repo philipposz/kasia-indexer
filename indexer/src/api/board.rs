@@ -689,6 +689,7 @@ fn build_pulse_reply_push_event(
         parent_author_address: parent_author_address.to_string(),
         actor_address: reply_author_address.to_string(),
         actor_display_name: reply_post.author.display_name.clone(),
+        actor_avatar_url: reply_post.author.avatar_url.clone(),
         preview_text: pulse_reply_preview_text(reply_post),
         timestamp: parse_timestamp_ms(&reply_post.created_at).unwrap_or_default(),
     })

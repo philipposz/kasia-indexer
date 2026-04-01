@@ -297,6 +297,7 @@ pub struct PulseReplyPushEvent {
     pub parent_author_address: String,
     pub actor_address: String,
     pub actor_display_name: String,
+    pub actor_avatar_url: Option<String>,
     pub preview_text: Option<String>,
     pub timestamp: u64,
 }
@@ -882,6 +883,11 @@ impl PushService {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| truncate_for_push(value, 180));
+        let actor_avatar_url = event
+            .actor_avatar_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
         let payload = json!({
             "aps": {
                 "alert": {
@@ -895,6 +901,7 @@ impl PushService {
             "type": "pulse_reply",
             "sender": actor_address,
             "post_id": event.post_id,
+            "actor_avatar_url": actor_avatar_url,
             "preview_text": preview_text,
             "timestamp": event.timestamp,
         });

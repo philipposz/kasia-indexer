@@ -65,13 +65,18 @@ pub struct BoardFeedQuery {
 #[serde(rename_all = "camelCase")]
 pub struct BoardCreatePostRequest {
     pub author_address: String,
+    #[serde(default)]
     pub author_display_name: String,
+    #[serde(default)]
     pub content_text: String,
     #[serde(default)]
     pub attachments: Vec<BoardAttachmentPayload>,
+    #[serde(default)]
     pub reply_to_post_id: Option<String>,
     #[serde(alias = "primaryLinkURL")]
+    #[serde(default)]
     pub primary_link_url: Option<String>,
+    #[serde(default)]
     pub created_at: String,
     pub client_generated_id: String,
     pub signature: String,

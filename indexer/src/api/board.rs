@@ -59,9 +59,9 @@ impl BoardApi {
         Router::new()
             .route("/feed", get(get_board_feed))
             .route("/posts", post(create_board_post))
-            .route("/posts/:post_id", get(get_board_post_detail))
-            .route("/posts/:post_id/replies", post(create_board_reply))
-            .route("/posts/:post_id/reactions", post(toggle_board_reaction))
+            .route("/posts/{post_id}", get(get_board_post_detail))
+            .route("/posts/{post_id}/replies", post(create_board_reply))
+            .route("/posts/{post_id}/reactions", post(toggle_board_reaction))
     }
 }
 

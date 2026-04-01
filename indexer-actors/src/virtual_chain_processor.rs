@@ -766,7 +766,9 @@ impl VirtualProcessor {
                     | PartitionId::TxIDToSelfStash
                     | PartitionId::BoardPostById
                     | PartitionId::BoardPostByCreatedAt
-                    | PartitionId::BoardClientGeneratedIdToPostId => {
+                    | PartitionId::BoardClientGeneratedIdToPostId
+                    | PartitionId::BoardReplyByParentCreatedAt
+                    | PartitionId::BoardReactionByPostActorEmoji => {
                         panic!("Unexpected partition id")
                     }
                     PartitionId::HandshakeByReceiver => size_of::<HandshakeKeyByReceiver>(),
@@ -792,7 +794,9 @@ impl VirtualProcessor {
                     | PartitionId::TxIDToSelfStash
                     | PartitionId::BoardPostById
                     | PartitionId::BoardPostByCreatedAt
-                    | PartitionId::BoardClientGeneratedIdToPostId => {
+                    | PartitionId::BoardClientGeneratedIdToPostId
+                    | PartitionId::BoardReplyByParentCreatedAt
+                    | PartitionId::BoardReactionByPostActorEmoji => {
                         panic!("Unexpected partition id")
                     }
                     PartitionId::HandshakeByReceiver => {

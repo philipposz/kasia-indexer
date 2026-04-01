@@ -152,4 +152,6 @@ pub enum PartitionId {
     BoardPostById = 18,
     BoardPostByCreatedAt = 19,
     BoardClientGeneratedIdToPostId = 20,
+    BoardReplyByParentCreatedAt = 21,
+    BoardReactionByPostActorEmoji = 22,
 }

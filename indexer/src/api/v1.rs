@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use indexer_actors::metrics::{IndexerMetricsSnapshot, SharedMetrics};
 use indexer_db::messages::board::{
     BoardClientGeneratedIdToPostIdPartition, BoardPostByCreatedAtPartition, BoardPostByIdPartition,
+    BoardReactionByPostActorEmojiPartition, BoardReplyByParentCreatedAtPartition,
 };
 use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
@@ -56,13 +57,16 @@ pub mod self_stash;
         push::update_device,
         push::unregister_device,
         crate::api::board::get_board_feed,
+        crate::api::board::get_board_post_detail,
         crate::api::board::create_board_post,
+        crate::api::board::create_board_reply,
+        crate::api::board::toggle_board_reaction,
         self_stash::get_self_stash_by_owner,
         self_stash::get_self_stash_by_scope,
         get_metrics,
     ),
     components(
-        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, gift::GiftChallengeResponse, gift::GiftClaimRequest, gift::GiftClaimResponse, gift::GiftDeviceCheckDebugQueryRequest, gift::GiftDeviceCheckDebugQueryResponse, gift::GiftDeviceCheckDebugUpdateRequest, gift::GiftDeviceCheckDebugUpdateResponse, gift::GiftErrorResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, crate::api::board::BoardFeedResponse, crate::api::board::BoardPostResponse, crate::api::board::BoardCreatePostRequest, crate::api::board::BoardAuthorResponse, crate::api::board::BoardAttachmentPayload, crate::api::board::BoardLinkPreviewResponse, crate::api::board::BoardErrorResponse, IndexerMetricsSnapshot)
+        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, gift::GiftChallengeResponse, gift::GiftClaimRequest, gift::GiftClaimResponse, gift::GiftDeviceCheckDebugQueryRequest, gift::GiftDeviceCheckDebugQueryResponse, gift::GiftDeviceCheckDebugUpdateRequest, gift::GiftDeviceCheckDebugUpdateResponse, gift::GiftErrorResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, crate::api::board::BoardFeedResponse, crate::api::board::BoardPostResponse, crate::api::board::BoardPostDetailResponse, crate::api::board::BoardCreatePostRequest, crate::api::board::BoardCreateReactionRequest, crate::api::board::BoardAuthorResponse, crate::api::board::BoardAttachmentPayload, crate::api::board::BoardLinkPreviewResponse, crate::api::board::BoardReactionSummaryResponse, crate::api::board::BoardErrorResponse, IndexerMetricsSnapshot)
     ),
     tags(
         (name = "Kasia Indexer API", description = "Kasia Indexer API")
@@ -101,6 +105,8 @@ impl Api {
         board_post_by_id_partition: BoardPostByIdPartition,
         board_post_by_created_at_partition: BoardPostByCreatedAtPartition,
         board_client_generated_id_to_post_id_partition: BoardClientGeneratedIdToPostIdPartition,
+        board_reply_by_parent_created_at_partition: BoardReplyByParentCreatedAtPartition,
+        board_reaction_by_post_actor_emoji_partition: BoardReactionByPostActorEmojiPartition,
         gift_api: GiftApi,
         push_api: PushApi,
         metrics: SharedMetrics,
@@ -146,6 +152,8 @@ impl Api {
             board_post_by_id_partition,
             board_post_by_created_at_partition,
             board_client_generated_id_to_post_id_partition,
+            board_reply_by_parent_created_at_partition,
+            board_reaction_by_post_actor_emoji_partition,
             context,
         );
 

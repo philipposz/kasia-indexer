@@ -1,4 +1,5 @@
 use crate::context::IndexerContext;
+use crate::push::{PulseReplyPushEvent, PushService};
 use anyhow::{Context, bail};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -32,6 +33,7 @@ pub struct BoardApi {
     board_reply_by_parent_created_at_partition: BoardReplyByParentCreatedAtPartition,
     board_reaction_by_post_actor_emoji_partition: BoardReactionByPostActorEmojiPartition,
     context: IndexerContext,
+    push_service: Option<PushService>,
 }
 
 impl BoardApi {
@@ -43,6 +45,7 @@ impl BoardApi {
         board_reply_by_parent_created_at_partition: BoardReplyByParentCreatedAtPartition,
         board_reaction_by_post_actor_emoji_partition: BoardReactionByPostActorEmojiPartition,
         context: IndexerContext,
+        push_service: Option<PushService>,
     ) -> Self {
         Self {
             tx_keyspace,
@@ -52,6 +55,7 @@ impl BoardApi {
             board_reply_by_parent_created_at_partition,
             board_reaction_by_post_actor_emoji_partition,
             context,
+            push_service,
         }
     }
 
@@ -356,14 +360,25 @@ pub async fn create_board_reply(
 ) -> impl IntoResponse {
     let parent_post_id = post_id.trim().to_string();
     let viewer_address = request.author_address.clone();
-    let result = spawn_blocking(move || -> anyhow::Result<BoardPostDetailResponse> {
-        create_post_record(&state, &request, Some(parent_post_id.as_str()))?;
-        build_post_detail_response(&state, parent_post_id.as_str(), Some(viewer_address.as_str()))
+    let push_service = state.push_service.clone();
+    let result = spawn_blocking(move || -> anyhow::Result<(BoardPostDetailResponse, Option<PulseReplyPushEvent>)> {
+        let parent_post = load_post_response(&state, parent_post_id.as_str())?;
+        let reply_post = create_post_record(&state, &request, Some(parent_post_id.as_str()))?;
+        let detail = build_post_detail_response(&state, parent_post_id.as_str(), Some(viewer_address.as_str()))?;
+        let push_event = build_pulse_reply_push_event(&parent_post, &reply_post);
+        Ok((detail, push_event))
     })
     .await;
 
     match result {
-        Ok(Ok(detail)) => Ok(Json(detail)),
+        Ok(Ok((detail, push_event))) => {
+            if let (Some(push_service), Some(push_event)) = (push_service, push_event) {
+                if let Err(error) = push_service.dispatch_pulse_reply(push_event).await {
+                    tracing::warn!(%error, "failed to dispatch pulse reply push");
+                }
+            }
+            Ok(Json(detail))
+        }
         Ok(Err(error)) => Err(status_for_board_error(&error, true)),
         Err(join_error) => Err(task_error_response(join_error)),
     }
@@ -648,6 +663,49 @@ fn load_post_response_from_rtx(
         .get_rtx(rtx, normalized_post_id)?
         .with_context(|| format!("board post {normalized_post_id} not found"))?;
     serde_json::from_slice(post_json.as_ref()).context("decode board post response")
+}
+
+fn load_post_response(state: &BoardApi, post_id: &str) -> anyhow::Result<BoardPostResponse> {
+    let rtx = state.tx_keyspace.read_tx();
+    load_post_response_from_rtx(&rtx, state, post_id)
+}
+
+fn build_pulse_reply_push_event(
+    parent_post: &BoardPostResponse,
+    reply_post: &BoardPostResponse,
+) -> Option<PulseReplyPushEvent> {
+    let parent_author_address = parent_post.author.address.trim();
+    let reply_author_address = reply_post.author.address.trim();
+    if parent_author_address.is_empty()
+        || reply_author_address.is_empty()
+        || parent_author_address.eq_ignore_ascii_case(reply_author_address)
+    {
+        return None;
+    }
+
+    Some(PulseReplyPushEvent {
+        reply_id: reply_post.id.clone(),
+        post_id: parent_post.id.clone(),
+        parent_author_address: parent_author_address.to_string(),
+        actor_address: reply_author_address.to_string(),
+        actor_display_name: reply_post.author.display_name.clone(),
+        preview_text: pulse_reply_preview_text(reply_post),
+        timestamp: parse_timestamp_ms(&reply_post.created_at).unwrap_or_default(),
+    })
+}
+
+fn pulse_reply_preview_text(reply_post: &BoardPostResponse) -> Option<String> {
+    let content_text = reply_post.content_text.trim();
+    if !content_text.is_empty() {
+        return Some(content_text.to_string());
+    }
+    if !reply_post.attachments.is_empty() {
+        return Some("Attachment".to_string());
+    }
+    if reply_post.primary_link_url.is_some() {
+        return Some("Link".to_string());
+    }
+    None
 }
 
 fn ensure_post_exists(

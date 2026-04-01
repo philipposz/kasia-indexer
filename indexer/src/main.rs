@@ -284,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
         board_reaction_by_post_actor_emoji_partition,
         gift_api,
         push_api,
+        push_service.clone(),
         metrics.clone(),
         context.clone(),
     );

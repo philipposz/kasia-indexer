@@ -34,6 +34,7 @@ pub enum PushMessageType {
     Handshake,
     Payment,
     Contextual,
+    PulseReply,
 }
 
 #[derive(Debug, Clone)]

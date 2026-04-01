@@ -6,6 +6,7 @@ use crate::api::v1::payments::PaymentApi;
 use crate::api::v1::push::PushApi;
 use crate::api::v1::self_stash::SelfStashApi;
 use crate::context::IndexerContext;
+use crate::push::PushService;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -109,6 +110,7 @@ impl Api {
         board_reaction_by_post_actor_emoji_partition: BoardReactionByPostActorEmojiPartition,
         gift_api: GiftApi,
         push_api: PushApi,
+        push_service: PushService,
         metrics: SharedMetrics,
         context: IndexerContext,
     ) -> Self {
@@ -155,6 +157,7 @@ impl Api {
             board_reply_by_parent_created_at_partition,
             board_reaction_by_post_actor_emoji_partition,
             context,
+            Some(push_service),
         );
 
         Self {

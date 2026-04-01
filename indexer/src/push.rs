@@ -153,6 +153,8 @@ struct DeviceRegistration {
     platform: String,
     app_bundle_id: Option<String>,
     watched_addresses: HashSet<String>,
+    #[serde(default)]
+    watch_pulse_reply_addresses: HashSet<String>,
     primary_address: Option<String>,
     aliases: Vec<String>,
     wallet_pubkey: String,
@@ -242,6 +244,8 @@ pub struct PushRegistrationRequest {
     pub platform: String,
     pub app_bundle_id: Option<String>,
     pub watched_addresses: Vec<String>,
+    #[serde(default)]
+    pub watch_pulse_reply_addresses: Vec<String>,
     pub primary_address: Option<String>,
     pub aliases: Option<Vec<String>>,
     pub auth: Option<PushAuthRequest>,
@@ -254,6 +258,8 @@ pub struct PushUpdateRequest {
     pub token_type: String,
     pub app_bundle_id: Option<String>,
     pub watched_addresses: Vec<String>,
+    #[serde(default)]
+    pub watch_pulse_reply_addresses: Vec<String>,
     pub primary_address: Option<String>,
     pub aliases: Option<Vec<String>>,
     pub auth: Option<PushAuthRequest>,
@@ -282,6 +288,17 @@ pub struct PushAuthRequest {
 struct ValidatedAuth {
     wallet_pubkey: String,
     wallet_address: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PulseReplyPushEvent {
+    pub reply_id: String,
+    pub post_id: String,
+    pub parent_author_address: String,
+    pub actor_address: String,
+    pub actor_display_name: String,
+    pub preview_text: Option<String>,
+    pub timestamp: u64,
 }
 
 impl PushService {
@@ -497,6 +514,7 @@ impl PushService {
                         // Contextual payload text is rendered by the iOS notification service extension.
                         // Keep backend fallback neutral to avoid leaking control-payload noise if extension processing fails.
                         PushMessageType::Contextual => " ",
+                        PushMessageType::PulseReply => "New Pulse reply",
                     }
                 },
                 "mutable-content": 1,
@@ -647,6 +665,12 @@ impl PushService {
                         .is_some_and(|value| value == receiver)
                         || registration.wallet_address == receiver
                 }
+                PushMessageType::PulseReply => {
+                    let Some(receiver) = receiver_address else {
+                        return false;
+                    };
+                    registration.watch_pulse_reply_addresses.contains(receiver)
+                }
             })
             .cloned()
             .collect()
@@ -703,6 +727,7 @@ impl PushService {
         let auth = self.validate_auth(request.auth.as_ref()).await?;
         let app_bundle_id = normalize_optional_bundle_id(request.app_bundle_id.as_deref());
         let watched_addresses = normalize_addresses(request.watched_addresses);
+        let watch_pulse_reply_addresses = normalize_addresses(request.watch_pulse_reply_addresses);
         let primary_address = normalize_optional_address(request.primary_address.as_deref());
         let aliases = normalize_aliases(request.aliases.unwrap_or_default());
 
@@ -728,6 +753,7 @@ impl PushService {
                 platform: request.platform.trim().to_lowercase(),
                 app_bundle_id,
                 watched_addresses,
+                watch_pulse_reply_addresses,
                 primary_address,
                 aliases,
                 wallet_pubkey: auth.wallet_pubkey,
@@ -755,6 +781,7 @@ impl PushService {
         let auth = self.validate_auth(request.auth.as_ref()).await?;
         let app_bundle_id = normalize_optional_bundle_id(request.app_bundle_id.as_deref());
         let watched_addresses = normalize_addresses(request.watched_addresses);
+        let watch_pulse_reply_addresses = normalize_addresses(request.watch_pulse_reply_addresses);
         let primary_address = normalize_optional_address(request.primary_address.as_deref());
         let aliases = normalize_aliases(request.aliases.unwrap_or_default());
 
@@ -772,6 +799,7 @@ impl PushService {
         registration.token_type = token_type;
         registration.app_bundle_id = app_bundle_id;
         registration.watched_addresses = watched_addresses;
+        registration.watch_pulse_reply_addresses = watch_pulse_reply_addresses;
         registration.primary_address = primary_address;
         registration.aliases = aliases;
         registration.wallet_address = auth.wallet_address;
@@ -811,6 +839,117 @@ impl PushService {
             .map_err(|error| {
                 PushApiError::internal(format!("failed to persist registrations: {error}"))
             })
+    }
+
+    pub async fn dispatch_pulse_reply(&self, event: PulseReplyPushEvent) -> anyhow::Result<()> {
+        self.dispatch_counters.events.fetch_add(1, Ordering::Relaxed);
+
+        let Some(apns_client) = &self.apns_client else {
+            return Ok(());
+        };
+
+        let parent_author_address = normalize_address(&event.parent_author_address)
+            .ok_or_else(|| anyhow::anyhow!("invalid pulse reply target address"))?;
+        let actor_address = normalize_address(&event.actor_address)
+            .ok_or_else(|| anyhow::anyhow!("invalid pulse reply actor address"))?;
+
+        let targets = self
+            .matching_registrations(
+                PushMessageType::PulseReply,
+                &actor_address,
+                Some(parent_author_address.as_str()),
+                None,
+            )
+            .await;
+        self.dispatch_counters
+            .targets
+            .fetch_add(targets.len() as u64, Ordering::Relaxed);
+
+        if targets.is_empty() {
+            return Ok(());
+        }
+
+        let actor_display_name = event.actor_display_name.trim();
+        let actor_display_name = if actor_display_name.is_empty() {
+            actor_address.clone()
+        } else {
+            actor_display_name.to_string()
+        };
+        let fallback_body = format!("{actor_display_name} replied to your Pulse");
+        let preview_text = event
+            .preview_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate_for_push(value, 180));
+        let payload = json!({
+            "aps": {
+                "alert": {
+                    "title": actor_display_name,
+                    "body": fallback_body
+                },
+                "mutable-content": 1,
+                "content-available": 1
+            },
+            "tx_id": event.reply_id,
+            "type": "pulse_reply",
+            "sender": actor_address,
+            "post_id": event.post_id,
+            "preview_text": preview_text,
+            "timestamp": event.timestamp,
+        });
+
+        for registration in targets {
+            if self
+                .was_recently_dispatched(
+                    &registration.device_token,
+                    event.reply_id.as_str(),
+                    PushMessageType::PulseReply,
+                )
+                .await
+            {
+                self.dispatch_counters.deduped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            self.dispatch_counters.attempts.fetch_add(1, Ordering::Relaxed);
+            match apns_client
+                .send_notification(
+                    &registration.device_token,
+                    &payload,
+                    PushMessageType::PulseReply,
+                )
+                .await
+            {
+                Ok(ApnsSendOutcome::Sent) => {
+                    self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
+                    self
+                        .mark_recent_dispatch(
+                            &registration.device_token,
+                            event.reply_id.as_str(),
+                            PushMessageType::PulseReply,
+                        )
+                        .await;
+                }
+                Ok(ApnsSendOutcome::InvalidToken) => {
+                    self.dispatch_counters.invalid.fetch_add(1, Ordering::Relaxed);
+                    self.remove_stale_registrations(vec![registration.device_token.clone()])
+                        .await?;
+                }
+                Err(error) => {
+                    self.dispatch_counters.failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        %error,
+                        token = %registration.device_token,
+                        post_id = %event.post_id,
+                        reply_id = %event.reply_id,
+                        "APNs delivery failed for pulse reply"
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn validate_token_and_type(&self, token: &str, token_type: &str) -> Result<(), PushApiError> {
@@ -1088,6 +1227,18 @@ fn push_message_type_tag(message_type: PushMessageType) -> &'static str {
         PushMessageType::Handshake => "handshake",
         PushMessageType::Payment => "payment",
         PushMessageType::Contextual => "contextual",
+        PushMessageType::PulseReply => "pulse_reply",
+    }
+}
+
+fn truncate_for_push(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    let mut iter = trimmed.chars();
+    let truncated: String = iter.by_ref().take(max_chars).collect();
+    if iter.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
 }
 

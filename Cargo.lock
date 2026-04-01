@@ -1701,6 +1701,7 @@ dependencies = [
  "rayon",
  "reqwest",
  "rolling-file",
+ "secp256k1",
  "serde",
  "serde_cbor",
  "serde_json",

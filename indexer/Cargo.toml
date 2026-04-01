@@ -41,6 +41,7 @@ sha2 = "0.10.8"
 x509-parser = "0.16.0"
 url = "2.5.7"
 zerocopy = { workspace = true }
+secp256k1 = { workspace = true }
 
 indexer-db = { path = "../indexer-db" }
 indexer-actors = { path = "../indexer-actors", features = ["serde", "utoipa"] }

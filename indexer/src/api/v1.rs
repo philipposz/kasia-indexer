@@ -14,6 +14,7 @@ use axum::{Json, Router};
 use indexer_actors::metrics::{IndexerMetricsSnapshot, SharedMetrics};
 use indexer_db::messages::board::{
     BoardClientGeneratedIdToPostIdPartition, BoardPostByCreatedAtPartition, BoardPostByIdPartition,
+    BoardFollowByFollowerTargetPartition, BoardFollowByTargetFollowerPartition,
     BoardReactionByPostActorEmojiPartition, BoardReplyByParentCreatedAtPartition,
 };
 use indexer_db::messages::contextual_message::{
@@ -58,16 +59,19 @@ pub mod self_stash;
         push::update_device,
         push::unregister_device,
         crate::api::board::get_board_feed,
+        crate::api::board::get_board_profile_feed,
+        crate::api::board::get_board_profile_connections,
         crate::api::board::get_board_post_detail,
         crate::api::board::create_board_post,
         crate::api::board::create_board_reply,
         crate::api::board::toggle_board_reaction,
+        crate::api::board::set_board_follow_state,
         self_stash::get_self_stash_by_owner,
         self_stash::get_self_stash_by_scope,
         get_metrics,
     ),
     components(
-        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, gift::GiftChallengeResponse, gift::GiftClaimRequest, gift::GiftClaimResponse, gift::GiftDeviceCheckDebugQueryRequest, gift::GiftDeviceCheckDebugQueryResponse, gift::GiftDeviceCheckDebugUpdateRequest, gift::GiftDeviceCheckDebugUpdateResponse, gift::GiftErrorResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, crate::api::board::BoardFeedResponse, crate::api::board::BoardPostResponse, crate::api::board::BoardPostDetailResponse, crate::api::board::BoardCreatePostRequest, crate::api::board::BoardCreateReactionRequest, crate::api::board::BoardAuthorResponse, crate::api::board::BoardAttachmentPayload, crate::api::board::BoardLinkPreviewResponse, crate::api::board::BoardReactionSummaryResponse, crate::api::board::BoardErrorResponse, IndexerMetricsSnapshot)
+        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, gift::GiftChallengeResponse, gift::GiftClaimRequest, gift::GiftClaimResponse, gift::GiftDeviceCheckDebugQueryRequest, gift::GiftDeviceCheckDebugQueryResponse, gift::GiftDeviceCheckDebugUpdateRequest, gift::GiftDeviceCheckDebugUpdateResponse, gift::GiftErrorResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, crate::api::board::BoardFeedResponse, crate::api::board::BoardPostResponse, crate::api::board::BoardPostDetailResponse, crate::api::board::BoardCreatePostRequest, crate::api::board::BoardCreateReactionRequest, crate::api::board::BoardCreateFollowRequest, crate::api::board::BoardAuthorResponse, crate::api::board::BoardAttachmentPayload, crate::api::board::BoardLinkPreviewResponse, crate::api::board::BoardReactionSummaryResponse, crate::api::board::BoardErrorResponse, crate::api::board::BoardProfileConnectionsResponse, crate::api::board::BoardFollowMutationResponse, IndexerMetricsSnapshot)
     ),
     tags(
         (name = "Kasia Indexer API", description = "Kasia Indexer API")
@@ -108,6 +112,8 @@ impl Api {
         board_client_generated_id_to_post_id_partition: BoardClientGeneratedIdToPostIdPartition,
         board_reply_by_parent_created_at_partition: BoardReplyByParentCreatedAtPartition,
         board_reaction_by_post_actor_emoji_partition: BoardReactionByPostActorEmojiPartition,
+        board_follow_by_follower_target_partition: BoardFollowByFollowerTargetPartition,
+        board_follow_by_target_follower_partition: BoardFollowByTargetFollowerPartition,
         gift_api: GiftApi,
         push_api: PushApi,
         push_service: PushService,
@@ -156,6 +162,8 @@ impl Api {
             board_client_generated_id_to_post_id_partition,
             board_reply_by_parent_created_at_partition,
             board_reaction_by_post_actor_emoji_partition,
+            board_follow_by_follower_target_partition,
+            board_follow_by_target_follower_partition,
             context,
             Some(push_service),
         );

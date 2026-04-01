@@ -8,11 +8,16 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use indexer_db::messages::board::{
     BoardClientGeneratedIdToPostIdPartition, BoardPostByCreatedAtKey, BoardPostByCreatedAtPartition,
+    BoardFollowByFollowerTargetPartition, BoardFollowByTargetFollowerPartition,
     BoardPostByIdPartition, BoardReactionByPostActorEmojiPartition,
     BoardReplyByParentCreatedAtKey, BoardReplyByParentCreatedAtPartition,
 };
 use indexer_db::AddressPayload;
+use kaspa_addresses::Version;
 use kaspa_rpc_core::RpcAddress;
+use secp256k1::ffi;
+use secp256k1::ffi::CPtr;
+use secp256k1::{Secp256k1, XOnlyPublicKey, schnorr};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -32,6 +37,8 @@ pub struct BoardApi {
     board_client_generated_id_to_post_id_partition: BoardClientGeneratedIdToPostIdPartition,
     board_reply_by_parent_created_at_partition: BoardReplyByParentCreatedAtPartition,
     board_reaction_by_post_actor_emoji_partition: BoardReactionByPostActorEmojiPartition,
+    board_follow_by_follower_target_partition: BoardFollowByFollowerTargetPartition,
+    board_follow_by_target_follower_partition: BoardFollowByTargetFollowerPartition,
     context: IndexerContext,
     push_service: Option<PushService>,
 }
@@ -44,6 +51,8 @@ impl BoardApi {
         board_client_generated_id_to_post_id_partition: BoardClientGeneratedIdToPostIdPartition,
         board_reply_by_parent_created_at_partition: BoardReplyByParentCreatedAtPartition,
         board_reaction_by_post_actor_emoji_partition: BoardReactionByPostActorEmojiPartition,
+        board_follow_by_follower_target_partition: BoardFollowByFollowerTargetPartition,
+        board_follow_by_target_follower_partition: BoardFollowByTargetFollowerPartition,
         context: IndexerContext,
         push_service: Option<PushService>,
     ) -> Self {
@@ -54,6 +63,8 @@ impl BoardApi {
             board_client_generated_id_to_post_id_partition,
             board_reply_by_parent_created_at_partition,
             board_reaction_by_post_actor_emoji_partition,
+            board_follow_by_follower_target_partition,
+            board_follow_by_target_follower_partition,
             context,
             push_service,
         }
@@ -63,6 +74,9 @@ impl BoardApi {
         Router::new()
             .route("/feed", get(get_board_feed))
             .route("/posts", post(create_board_post))
+            .route("/profile/{address}", get(get_board_profile_feed))
+            .route("/profile/{address}/connections", get(get_board_profile_connections))
+            .route("/profile/{address}/follow", post(set_board_follow_state))
             .route("/posts/{post_id}", get(get_board_post_detail))
             .route("/posts/{post_id}/replies", post(create_board_reply))
             .route("/posts/{post_id}/reactions", post(toggle_board_reaction))
@@ -79,6 +93,13 @@ pub struct BoardFeedQuery {
 #[derive(Debug, Deserialize, IntoParams)]
 #[serde(rename_all = "camelCase")]
 pub struct BoardPostDetailQuery {
+    pub viewer_address: Option<String>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardProfileQuery {
+    pub limit: Option<usize>,
     pub viewer_address: Option<String>,
 }
 
@@ -114,6 +135,78 @@ pub struct BoardCreateReactionRequest {
     pub client_generated_id: String,
     pub signature: String,
     pub network: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardCreateFollowRequest {
+    pub actor_address: String,
+    #[serde(default)]
+    pub actor_display_name: String,
+    #[serde(default)]
+    pub actor_avatar_url: Option<String>,
+    #[serde(default)]
+    pub actor_avatar_file_id: Option<String>,
+    #[serde(default)]
+    pub actor_avatar_file_extension: Option<String>,
+    pub target_address: String,
+    #[serde(default)]
+    pub target_display_name: String,
+    #[serde(default)]
+    pub target_avatar_url: Option<String>,
+    #[serde(default)]
+    pub target_avatar_file_id: Option<String>,
+    #[serde(default)]
+    pub target_avatar_file_extension: Option<String>,
+    pub follow: bool,
+    #[serde(default)]
+    pub created_at: String,
+    pub client_generated_id: String,
+    pub signature: String,
+    pub network: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BoardCreatePostSignablePayload {
+    author_address: String,
+    author_display_name: String,
+    content_text: String,
+    attachments: Vec<BoardAttachmentPayload>,
+    reply_to_post_id: Option<String>,
+    primary_link_url: Option<String>,
+    created_at: String,
+    client_generated_id: String,
+    network: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BoardCreateReactionSignablePayload {
+    actor_address: String,
+    emoji: String,
+    created_at: String,
+    client_generated_id: String,
+    network: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BoardCreateFollowSignablePayload {
+    actor_address: String,
+    actor_display_name: String,
+    actor_avatar_url: Option<String>,
+    actor_avatar_file_id: Option<String>,
+    actor_avatar_file_extension: Option<String>,
+    target_address: String,
+    target_display_name: String,
+    target_avatar_url: Option<String>,
+    target_avatar_file_id: Option<String>,
+    target_avatar_file_extension: Option<String>,
+    follow: bool,
+    created_at: String,
+    client_generated_id: String,
+    network: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, ToSchema, Clone)]
@@ -205,6 +298,29 @@ pub struct BoardFeedResponse {
     pub server_time: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardProfileConnectionsResponse {
+    pub address: String,
+    pub following: Vec<BoardAuthorResponse>,
+    pub followers: Vec<BoardAuthorResponse>,
+    pub following_count: i32,
+    pub follower_count: i32,
+    pub viewer_follows_author: bool,
+    pub server_time: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardFollowMutationResponse {
+    pub target_address: String,
+    pub actor_address: String,
+    pub is_following: bool,
+    pub following_count: i32,
+    pub follower_count: i32,
+    pub server_time: String,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BoardErrorResponse {
     pub error: String,
@@ -281,6 +397,90 @@ pub async fn get_board_feed(
     match result {
         Ok(Ok(feed)) => Ok(Json(feed)),
         Ok(Err(error)) => Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, error)),
+        Err(join_error) => Err(task_error_response(join_error)),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/board/profile/{address}",
+    params(
+        ("address" = String, Path, description = "Kaspa address"),
+        BoardProfileQuery
+    ),
+    responses(
+        (status = 200, description = "Get posts by author", body = BoardFeedResponse),
+        (status = 400, description = "Bad request", body = BoardErrorResponse),
+        (status = 500, description = "Internal server error", body = BoardErrorResponse)
+    )
+)]
+pub async fn get_board_profile_feed(
+    State(state): State<BoardApi>,
+    Path(address): Path<String>,
+    Query(query): Query<BoardProfileQuery>,
+) -> impl IntoResponse {
+    let normalized_address = address.trim().to_lowercase();
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    let result = spawn_blocking(move || -> anyhow::Result<BoardFeedResponse> {
+        validate_board_actor_address("address", normalized_address.as_str())?;
+        let rtx = state.tx_keyspace.read_tx();
+        let mut items = Vec::with_capacity(limit);
+
+        for entry in state.board_post_by_created_at_partition.iter_all(&rtx).rev() {
+            let (_key, value) = entry?;
+            let post: BoardPostResponse =
+                serde_json::from_slice(value.as_ref()).context("decode board post from author feed")?;
+            if post.author.address.trim().eq_ignore_ascii_case(normalized_address.as_str()) {
+                items.push(post);
+            }
+            if items.len() >= limit {
+                break;
+            }
+        }
+
+        Ok(BoardFeedResponse {
+            items,
+            next_cursor: None,
+            server_time: timestamp_string(OffsetDateTime::now_utc())?,
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(feed)) => Ok(Json(feed)),
+        Ok(Err(error)) => Err(status_for_board_error(&error, false)),
+        Err(join_error) => Err(task_error_response(join_error)),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/board/profile/{address}/connections",
+    params(
+        ("address" = String, Path, description = "Kaspa address"),
+        BoardProfileQuery
+    ),
+    responses(
+        (status = 200, description = "Get Pulse followers/following for an address", body = BoardProfileConnectionsResponse),
+        (status = 400, description = "Bad request", body = BoardErrorResponse),
+        (status = 500, description = "Internal server error", body = BoardErrorResponse)
+    )
+)]
+pub async fn get_board_profile_connections(
+    State(state): State<BoardApi>,
+    Path(address): Path<String>,
+    Query(query): Query<BoardProfileQuery>,
+) -> impl IntoResponse {
+    let normalized_address = address.trim().to_lowercase();
+    let viewer_address = query.viewer_address;
+    let result = spawn_blocking(move || {
+        build_profile_connections_response(&state, normalized_address.as_str(), viewer_address.as_deref())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(response)) => Ok(Json(response)),
+        Ok(Err(error)) => Err(status_for_board_error(&error, false)),
         Err(join_error) => Err(task_error_response(join_error)),
     }
 }
@@ -414,6 +614,40 @@ pub async fn toggle_board_reaction(
         Ok(Err(error)) => Err(status_for_board_error(&error, false)),
         Err(join_error) => Err(task_error_response(join_error)),
     }
+}
+
+#[utoipa::path(
+    post,
+    path = "/board/profile/{address}/follow",
+    params(("address" = String, Path, description = "Target author address")),
+    request_body = BoardCreateFollowRequest,
+    responses(
+        (status = 200, description = "Follow or unfollow a Pulse author", body = BoardFollowMutationResponse),
+        (status = 400, description = "Bad request", body = BoardErrorResponse),
+        (status = 500, description = "Internal server error", body = BoardErrorResponse)
+    )
+)]
+pub async fn set_board_follow_state(
+    State(state): State<BoardApi>,
+    Path(address): Path<String>,
+    Json(request): Json<BoardCreateFollowRequest>,
+) -> impl IntoResponse {
+    let normalized_target_address = address.trim().to_string();
+    let result = spawn_blocking(move || apply_follow_state(&state, normalized_target_address.as_str(), &request)).await;
+
+    match result {
+        Ok(Ok(response)) => Ok(Json(response)),
+        Ok(Err(error)) => Err(status_for_board_error(&error, false)),
+        Err(join_error) => Err(task_error_response(join_error)),
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct StoredBoardFollowRecord {
+    actor: BoardAuthorResponse,
+    target: BoardAuthorResponse,
+    created_at: String,
 }
 
 fn create_post_record(
@@ -556,6 +790,139 @@ fn toggle_reaction_record(
     wtx.commit()?
         .map_err(|_| anyhow::anyhow!("board reaction write conflict"))?;
     Ok(())
+}
+
+fn apply_follow_state(
+    state: &BoardApi,
+    path_target_address: &str,
+    request: &BoardCreateFollowRequest,
+) -> anyhow::Result<BoardFollowMutationResponse> {
+    validate_create_follow_request(request, &state.context, path_target_address)?;
+
+    let normalized_actor_address = request.actor_address.trim().to_lowercase();
+    let normalized_target_address = path_target_address.trim().to_lowercase();
+
+    let actor = BoardAuthorResponse {
+        address: normalized_actor_address.clone(),
+        display_name: normalized_or_fallback(&request.actor_display_name, normalized_actor_address.as_str()),
+        avatar_url: normalized_optional(&request.actor_avatar_url),
+        avatar_file_id: normalized_optional(&request.actor_avatar_file_id),
+        avatar_file_extension: normalized_optional(&request.actor_avatar_file_extension),
+    };
+    let target = BoardAuthorResponse {
+        address: normalized_target_address.clone(),
+        display_name: normalized_or_fallback(&request.target_display_name, normalized_target_address.as_str()),
+        avatar_url: normalized_optional(&request.target_avatar_url),
+        avatar_file_id: normalized_optional(&request.target_avatar_file_id),
+        avatar_file_extension: normalized_optional(&request.target_avatar_file_extension),
+    };
+    let created_at = parse_requested_created_at(&request.created_at)?;
+    let created_at_string = timestamp_string(created_at)?;
+    let record = StoredBoardFollowRecord {
+        actor,
+        target,
+        created_at: created_at_string,
+    };
+    let record_bytes = serde_json::to_vec(&record).context("serialize board follow record")?;
+
+    let mut wtx = state.tx_keyspace.write_tx()?;
+    if request.follow {
+        state.board_follow_by_follower_target_partition.insert_wtx(
+            &mut wtx,
+            normalized_actor_address.as_str(),
+            normalized_target_address.as_str(),
+            &record_bytes,
+        );
+        state.board_follow_by_target_follower_partition.insert_wtx(
+            &mut wtx,
+            normalized_target_address.as_str(),
+            normalized_actor_address.as_str(),
+            &record_bytes,
+        );
+    } else {
+        state.board_follow_by_follower_target_partition.remove_wtx(
+            &mut wtx,
+            normalized_actor_address.as_str(),
+            normalized_target_address.as_str(),
+        );
+        state.board_follow_by_target_follower_partition.remove_wtx(
+            &mut wtx,
+            normalized_target_address.as_str(),
+            normalized_actor_address.as_str(),
+        );
+    }
+    wtx.commit()?
+        .map_err(|_| anyhow::anyhow!("board follow write conflict"))?;
+
+    let connections =
+        build_profile_connections_response(state, normalized_target_address.as_str(), Some(normalized_actor_address.as_str()))?;
+
+    Ok(BoardFollowMutationResponse {
+        target_address: normalized_target_address,
+        actor_address: normalized_actor_address,
+        is_following: connections.viewer_follows_author,
+        following_count: connections.following_count,
+        follower_count: connections.follower_count,
+        server_time: connections.server_time,
+    })
+}
+
+fn build_profile_connections_response(
+    state: &BoardApi,
+    address: &str,
+    viewer_address: Option<&str>,
+) -> anyhow::Result<BoardProfileConnectionsResponse> {
+    validate_board_actor_address("address", address)?;
+    let normalized_address = address.trim().to_lowercase();
+    let normalized_viewer_address = viewer_address
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_lowercase());
+
+    let rtx = state.tx_keyspace.read_tx();
+
+    let following = state
+        .board_follow_by_follower_target_partition
+        .get_by_follower(&rtx, normalized_address.as_str())?
+        .into_iter()
+        .filter_map(|(_key, value)| {
+            serde_json::from_slice::<StoredBoardFollowRecord>(value.as_ref())
+                .ok()
+                .map(|record| record.target)
+        })
+        .collect::<Vec<_>>();
+
+    let followers = state
+        .board_follow_by_target_follower_partition
+        .get_by_target(&rtx, normalized_address.as_str())?
+        .into_iter()
+        .filter_map(|(_key, value)| {
+            serde_json::from_slice::<StoredBoardFollowRecord>(value.as_ref())
+                .ok()
+                .map(|record| record.actor)
+        })
+        .collect::<Vec<_>>();
+
+    let viewer_follows_author = normalized_viewer_address
+        .as_deref()
+        .filter(|viewer| *viewer != normalized_address)
+        .map(|viewer| {
+            state
+                .board_follow_by_follower_target_partition
+                .contains_rtx(&rtx, viewer, normalized_address.as_str())
+        })
+        .transpose()?
+        .unwrap_or(false);
+
+    Ok(BoardProfileConnectionsResponse {
+        address: normalized_address,
+        following_count: i32::try_from(following.len()).unwrap_or(i32::MAX),
+        follower_count: i32::try_from(followers.len()).unwrap_or(i32::MAX),
+        following,
+        followers,
+        viewer_follows_author,
+        server_time: timestamp_string(OffsetDateTime::now_utc())?,
+    })
 }
 
 fn build_post_detail_response(
@@ -823,7 +1190,22 @@ fn validate_create_post_request(
         _ => {}
     }
 
-    // TODO: verify the Schnorr signature against a server-compatible public identity derivation.
+    let signable_payload = BoardCreatePostSignablePayload {
+        author_address: request.author_address.clone(),
+        author_display_name: request.author_display_name.clone(),
+        content_text: request.content_text.clone(),
+        attachments: request.attachments.clone(),
+        reply_to_post_id: request.reply_to_post_id.clone(),
+        primary_link_url: request.primary_link_url.clone(),
+        created_at: request.created_at.clone(),
+        client_generated_id: request.client_generated_id.clone(),
+        network: request.network.clone(),
+    };
+    verify_board_signature(
+        request.author_address.as_str(),
+        canonical_json_bytes(&signable_payload)?.as_slice(),
+        request.signature.as_str(),
+    )?;
     Ok(())
 }
 
@@ -850,6 +1232,70 @@ fn validate_create_reaction_request(
     }
 
     validate_network(context, request.network.as_str())?;
+    let signable_payload = BoardCreateReactionSignablePayload {
+        actor_address: request.actor_address.clone(),
+        emoji: request.emoji.clone(),
+        created_at: request.created_at.clone(),
+        client_generated_id: request.client_generated_id.clone(),
+        network: request.network.clone(),
+    };
+    verify_board_signature(
+        request.actor_address.as_str(),
+        canonical_json_bytes(&signable_payload)?.as_slice(),
+        request.signature.as_str(),
+    )?;
+    Ok(())
+}
+
+fn validate_create_follow_request(
+    request: &BoardCreateFollowRequest,
+    context: &IndexerContext,
+    path_target_address: &str,
+) -> anyhow::Result<()> {
+    validate_board_actor_address("actorAddress", request.actor_address.as_str())?;
+    validate_board_actor_address("targetAddress", request.target_address.as_str())?;
+    validate_board_actor_address("pathTargetAddress", path_target_address)?;
+
+    let normalized_target = request.target_address.trim().to_lowercase();
+    let normalized_path_target = path_target_address.trim().to_lowercase();
+    if normalized_target != normalized_path_target {
+        bail!("targetAddress does not match the target board profile");
+    }
+
+    let normalized_actor = request.actor_address.trim().to_lowercase();
+    if normalized_actor == normalized_target {
+        bail!("you cannot follow yourself");
+    }
+
+    if request.signature.trim().is_empty() {
+        bail!("signature is required");
+    }
+    if request.client_generated_id.trim().is_empty() {
+        bail!("clientGeneratedId is required");
+    }
+
+    validate_network(context, request.network.as_str())?;
+    let signable_payload = BoardCreateFollowSignablePayload {
+        actor_address: request.actor_address.clone(),
+        actor_display_name: request.actor_display_name.clone(),
+        actor_avatar_url: request.actor_avatar_url.clone(),
+        actor_avatar_file_id: request.actor_avatar_file_id.clone(),
+        actor_avatar_file_extension: request.actor_avatar_file_extension.clone(),
+        target_address: request.target_address.clone(),
+        target_display_name: request.target_display_name.clone(),
+        target_avatar_url: request.target_avatar_url.clone(),
+        target_avatar_file_id: request.target_avatar_file_id.clone(),
+        target_avatar_file_extension: request.target_avatar_file_extension.clone(),
+        follow: request.follow,
+        created_at: request.created_at.clone(),
+        client_generated_id: request.client_generated_id.clone(),
+        network: request.network.clone(),
+    };
+    verify_board_signature(
+        request.actor_address.as_str(),
+        canonical_json_bytes(&signable_payload)?.as_slice(),
+        request.signature.as_str(),
+    )?;
     Ok(())
 }
 
@@ -863,6 +1309,82 @@ fn validate_board_actor_address(field_name: &str, address: &str) -> anyhow::Resu
     let _address_payload =
         AddressPayload::try_from(&rpc_address).with_context(|| format!("{field_name} payload is invalid"))?;
     Ok(())
+}
+
+fn verify_board_signature(address: &str, message_bytes: &[u8], signature_hex: &str) -> anyhow::Result<()> {
+    let address_text = address.trim();
+    let rpc_address =
+        RpcAddress::try_from(address_text).with_context(|| format!("{address_text} is not a valid Kaspa address"))?;
+    let address_payload =
+        AddressPayload::try_from(&rpc_address).with_context(|| format!("{address_text} payload is invalid"))?;
+
+    let version = Version::try_from(u8::MAX - address_payload.inverse_version)
+        .context("unsupported Kaspa address version for Pulse signature verification")?;
+    if version != Version::PubKey {
+        bail!("Pulse signature verification currently requires a Schnorr public-key address");
+    }
+
+    let pubkey = XOnlyPublicKey::from_slice(&address_payload.payload[..32])
+        .context("failed to parse x-only public key from Kaspa address")?;
+
+    let signature_bytes = decode_fixed_hex::<64>(signature_hex.trim(), "signature")?;
+    let signature = schnorr::Signature::from_slice(&signature_bytes)
+        .context("failed to parse Schnorr signature")?;
+    let serialized_signature = signature.serialize();
+
+    let secp = Secp256k1::verification_only();
+    let verified = unsafe {
+        ffi::secp256k1_schnorrsig_verify(
+            secp.ctx().as_ptr(),
+            serialized_signature.as_ptr(),
+            message_bytes.as_ptr(),
+            message_bytes.len(),
+            pubkey.as_c_ptr(),
+        )
+    };
+
+    if verified == 1 {
+        Ok(())
+    } else {
+        bail!("signature verification failed")
+    }
+}
+
+fn canonical_json_bytes<T: Serialize>(value: &T) -> anyhow::Result<Vec<u8>> {
+    let value = serde_json::to_value(value).context("encode Pulse signing payload")?;
+    let value = recursively_sorted_json(value);
+    serde_json::to_vec(&value).context("encode canonical Pulse signing payload")
+}
+
+fn decode_fixed_hex<const N: usize>(value: &str, label: &str) -> anyhow::Result<[u8; N]> {
+    let hex = value.trim();
+    if hex.len() != N * 2 {
+        bail!("{label} must be {} hex characters", N * 2);
+    }
+    let mut bytes = [0u8; N];
+    faster_hex::hex_decode(hex.as_bytes(), &mut bytes).with_context(|| format!("decode {label} hex"))?;
+    Ok(bytes)
+}
+
+fn recursively_sorted_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted = serde_json::Map::with_capacity(map.len());
+            let mut entries = map.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|lhs, rhs| lhs.0.cmp(&rhs.0));
+            for (key, value) in entries {
+                sorted.insert(key, recursively_sorted_json(value));
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .into_iter()
+                .map(recursively_sorted_json)
+                .collect::<Vec<_>>(),
+        ),
+        other => other,
+    }
 }
 
 fn validate_network(context: &IndexerContext, network_text: &str) -> anyhow::Result<()> {

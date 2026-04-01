@@ -223,3 +223,131 @@ impl BoardReactionByPostActorEmojiPartition {
         format!("{}|", post_id.trim())
     }
 }
+
+#[derive(Clone)]
+pub struct BoardFollowByFollowerTargetPartition(fjall::TxPartition);
+
+impl BoardFollowByFollowerTargetPartition {
+    pub fn new(keyspace: &fjall::TxKeyspace) -> Result<Self> {
+        Ok(Self(keyspace.open_partition(
+            "board_follow_by_follower_target",
+            PartitionCreateOptions::default(),
+        )?))
+    }
+
+    pub fn insert_wtx(
+        &self,
+        wtx: &mut WriteTransaction,
+        follower_address: &str,
+        target_address: &str,
+        json_bytes: &[u8],
+    ) {
+        let key = Self::key(follower_address, target_address);
+        wtx.insert(&self.0, key.as_bytes(), json_bytes);
+    }
+
+    pub fn remove_wtx(
+        &self,
+        wtx: &mut WriteTransaction,
+        follower_address: &str,
+        target_address: &str,
+    ) {
+        let key = Self::key(follower_address, target_address);
+        wtx.remove(&self.0, key.as_bytes());
+    }
+
+    pub fn contains_rtx(
+        &self,
+        rtx: &ReadTransaction,
+        follower_address: &str,
+        target_address: &str,
+    ) -> Result<bool> {
+        let key = Self::key(follower_address, target_address);
+        Ok(rtx.get(&self.0, key.as_bytes())?.is_some())
+    }
+
+    pub fn get_by_follower(
+        &self,
+        rtx: &ReadTransaction,
+        follower_address: &str,
+    ) -> Result<Vec<(SharedImmutable<[u8]>, SharedImmutable<[u8]>)>> {
+        let prefix = Self::follower_prefix(follower_address);
+        rtx.prefix(&self.0, prefix.as_bytes())
+            .map(|item| {
+                let (key, value) = item?;
+                Ok((SharedImmutable::new(key), SharedImmutable::new(value)))
+            })
+            .collect()
+    }
+
+    fn key(follower_address: &str, target_address: &str) -> String {
+        format!(
+            "{}|{}",
+            follower_address.trim().to_lowercase(),
+            target_address.trim().to_lowercase()
+        )
+    }
+
+    fn follower_prefix(follower_address: &str) -> String {
+        format!("{}|", follower_address.trim().to_lowercase())
+    }
+}
+
+#[derive(Clone)]
+pub struct BoardFollowByTargetFollowerPartition(fjall::TxPartition);
+
+impl BoardFollowByTargetFollowerPartition {
+    pub fn new(keyspace: &fjall::TxKeyspace) -> Result<Self> {
+        Ok(Self(keyspace.open_partition(
+            "board_follow_by_target_follower",
+            PartitionCreateOptions::default(),
+        )?))
+    }
+
+    pub fn insert_wtx(
+        &self,
+        wtx: &mut WriteTransaction,
+        target_address: &str,
+        follower_address: &str,
+        json_bytes: &[u8],
+    ) {
+        let key = Self::key(target_address, follower_address);
+        wtx.insert(&self.0, key.as_bytes(), json_bytes);
+    }
+
+    pub fn remove_wtx(
+        &self,
+        wtx: &mut WriteTransaction,
+        target_address: &str,
+        follower_address: &str,
+    ) {
+        let key = Self::key(target_address, follower_address);
+        wtx.remove(&self.0, key.as_bytes());
+    }
+
+    pub fn get_by_target(
+        &self,
+        rtx: &ReadTransaction,
+        target_address: &str,
+    ) -> Result<Vec<(SharedImmutable<[u8]>, SharedImmutable<[u8]>)>> {
+        let prefix = Self::target_prefix(target_address);
+        rtx.prefix(&self.0, prefix.as_bytes())
+            .map(|item| {
+                let (key, value) = item?;
+                Ok((SharedImmutable::new(key), SharedImmutable::new(value)))
+            })
+            .collect()
+    }
+
+    fn key(target_address: &str, follower_address: &str) -> String {
+        format!(
+            "{}|{}",
+            target_address.trim().to_lowercase(),
+            follower_address.trim().to_lowercase()
+        )
+    }
+
+    fn target_prefix(target_address: &str) -> String {
+        format!("{}|", target_address.trim().to_lowercase())
+    }
+}

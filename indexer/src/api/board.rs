@@ -91,12 +91,15 @@ pub struct BoardAttachmentPayload {
     #[serde(rename = "type")]
     pub kind: String,
     pub relay_file_id: String,
+    #[serde(alias = "relayDownloadURL")]
     pub relay_download_url: String,
+    #[serde(alias = "downloadURL")]
     pub download_url: String,
     pub mime_type: String,
     pub file_name: String,
     pub file_extension: String,
     pub size_bytes: Option<i64>,
+    #[serde(alias = "thumbnailURL")]
     pub thumbnail_url: Option<String>,
     pub width: Option<i32>,
     pub height: Option<i32>,

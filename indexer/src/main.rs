@@ -19,6 +19,9 @@ use indexer_db::messages::contextual_message::{
 use indexer_db::messages::handshake::{
     HandshakeByReceiverPartition, HandshakeBySenderPartition, TxIdToHandshakePartition,
 };
+use indexer_db::messages::board::{
+    BoardClientGeneratedIdToPostIdPartition, BoardPostByCreatedAtPartition, BoardPostByIdPartition,
+};
 use indexer_db::messages::payment::{
     PaymentByReceiverPartition, PaymentBySenderPartition, TxIdToPaymentPartition,
 };
@@ -87,6 +90,10 @@ async fn main() -> anyhow::Result<()> {
     let self_stash_by_owner_partition = SelfStashByOwnerPartition::new(&tx_keyspace)?;
     let self_stash_by_scope_partition = SelfStashByScopePartition::new(&tx_keyspace)?;
     let tx_id_to_self_stash_partition = TxIdToSelfStashPartition::new(&tx_keyspace)?;
+    let board_post_by_id_partition = BoardPostByIdPartition::new(&tx_keyspace)?;
+    let board_post_by_created_at_partition = BoardPostByCreatedAtPartition::new(&tx_keyspace)?;
+    let board_client_generated_id_to_post_id_partition =
+        BoardClientGeneratedIdToPostIdPartition::new(&tx_keyspace)?;
     let tx_id_to_acceptance_partition = TxIDToAcceptancePartition::new(&tx_keyspace)?;
     let block_compact_header_partition = BlockCompactHeaderPartition::new(&tx_keyspace)?;
     let acceptance_to_tx_id_partition = AcceptingBlockToTxIDPartition::new(&tx_keyspace)?;
@@ -265,6 +272,9 @@ async fn main() -> anyhow::Result<()> {
         self_stash_by_owner_partition,
         self_stash_by_scope_partition,
         tx_id_to_self_stash_partition,
+        board_post_by_id_partition,
+        board_post_by_created_at_partition,
+        board_client_generated_id_to_post_id_partition,
         gift_api,
         push_api,
         metrics.clone(),

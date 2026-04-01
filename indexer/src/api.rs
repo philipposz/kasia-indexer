@@ -3,6 +3,7 @@ use kaspa_addresses::{Address, Version};
 use kaspa_rpc_core::{RpcAddress, RpcNetworkType};
 
 pub mod v1;
+pub mod board;
 
 pub fn to_rpc_address(
     address_payload: &AddressPayload,

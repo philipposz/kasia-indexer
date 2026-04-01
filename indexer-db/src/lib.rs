@@ -149,4 +149,7 @@ pub enum PartitionId {
     SelfStashByOwner = 15,
     TxIDToSelfStash = 16,
     SelfStashByScope = 17,
+    BoardPostById = 18,
+    BoardPostByCreatedAt = 19,
+    BoardClientGeneratedIdToPostId = 20,
 }

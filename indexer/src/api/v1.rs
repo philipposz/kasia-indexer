@@ -1,3 +1,4 @@
+use crate::api::board::BoardApi;
 use crate::api::v1::contextual_messages::ContextualMessageApi;
 use crate::api::v1::gift::GiftApi;
 use crate::api::v1::handshakes::HandshakeApi;
@@ -10,6 +11,9 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use indexer_actors::metrics::{IndexerMetricsSnapshot, SharedMetrics};
+use indexer_db::messages::board::{
+    BoardClientGeneratedIdToPostIdPartition, BoardPostByCreatedAtPartition, BoardPostByIdPartition,
+};
 use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
 };
@@ -51,12 +55,14 @@ pub mod self_stash;
         push::register_device,
         push::update_device,
         push::unregister_device,
+        crate::api::board::get_board_feed,
+        crate::api::board::create_board_post,
         self_stash::get_self_stash_by_owner,
         self_stash::get_self_stash_by_scope,
         get_metrics,
     ),
     components(
-        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, gift::GiftChallengeResponse, gift::GiftClaimRequest, gift::GiftClaimResponse, gift::GiftDeviceCheckDebugQueryRequest, gift::GiftDeviceCheckDebugQueryResponse, gift::GiftDeviceCheckDebugUpdateRequest, gift::GiftDeviceCheckDebugUpdateResponse, gift::GiftErrorResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, IndexerMetricsSnapshot)
+        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, gift::GiftChallengeResponse, gift::GiftClaimRequest, gift::GiftClaimResponse, gift::GiftDeviceCheckDebugQueryRequest, gift::GiftDeviceCheckDebugQueryResponse, gift::GiftDeviceCheckDebugUpdateRequest, gift::GiftDeviceCheckDebugUpdateResponse, gift::GiftErrorResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, crate::api::board::BoardFeedResponse, crate::api::board::BoardPostResponse, crate::api::board::BoardCreatePostRequest, crate::api::board::BoardAuthorResponse, crate::api::board::BoardAttachmentPayload, crate::api::board::BoardLinkPreviewResponse, crate::api::board::BoardErrorResponse, IndexerMetricsSnapshot)
     ),
     tags(
         (name = "Kasia Indexer API", description = "Kasia Indexer API")
@@ -71,6 +77,7 @@ pub struct Api {
     payment_api: PaymentApi,
     gift_api: GiftApi,
     push_api: PushApi,
+    board_api: BoardApi,
     self_stash_api: SelfStashApi,
     metrics: SharedMetrics,
 }
@@ -91,6 +98,9 @@ impl Api {
         self_stash_by_owner_partition: SelfStashByOwnerPartition,
         self_stash_by_scope_partition: SelfStashByScopePartition,
         tx_id_to_self_stash_partition: TxIdToSelfStashPartition,
+        board_post_by_id_partition: BoardPostByIdPartition,
+        board_post_by_created_at_partition: BoardPostByCreatedAtPartition,
+        board_client_generated_id_to_post_id_partition: BoardClientGeneratedIdToPostIdPartition,
         gift_api: GiftApi,
         push_api: PushApi,
         metrics: SharedMetrics,
@@ -123,11 +133,19 @@ impl Api {
         );
 
         let self_stash_api = SelfStashApi::new(
-            tx_keyspace,
+            tx_keyspace.clone(),
             self_stash_by_owner_partition,
             self_stash_by_scope_partition,
             tx_id_to_acceptance_partition,
             tx_id_to_self_stash_partition,
+            context.clone(),
+        );
+
+        let board_api = BoardApi::new(
+            tx_keyspace,
+            board_post_by_id_partition,
+            board_post_by_created_at_partition,
+            board_client_generated_id_to_post_id_partition,
             context,
         );
 
@@ -137,6 +155,7 @@ impl Api {
             payment_api,
             gift_api,
             push_api,
+            board_api,
             self_stash_api,
             metrics,
         }
@@ -186,6 +205,7 @@ impl Api {
                 "/v1/push",
                 PushApi::router().with_state(self.push_api.clone()),
             )
+            .nest("/board", BoardApi::router().with_state(self.board_api.clone()))
             .route(
                 "/metrics",
                 get(get_metrics).with_state(self.metrics.clone()),

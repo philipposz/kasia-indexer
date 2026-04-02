@@ -38,6 +38,9 @@ jsonwebtoken = { workspace = true }
 base64 = "0.22.1"
 serde_cbor = "0.11.2"
 sha2 = "0.10.8"
+hmac = "0.12.1"
+pbkdf2 = "0.12.2"
+unicode-normalization = "0.1.24"
 x509-parser = "0.16.0"
 url = "2.5.7"
 zerocopy = { workspace = true }

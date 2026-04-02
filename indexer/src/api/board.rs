@@ -10,6 +10,7 @@ use indexer_db::messages::board::{
     BoardClientGeneratedIdToPostIdPartition, BoardPostByCreatedAtKey, BoardPostByCreatedAtPartition,
     BoardFollowByFollowerTargetPartition, BoardFollowByTargetFollowerPartition,
     BoardPostByIdPartition, BoardReactionByPostActorEmojiPartition,
+    BoardReportByPostActorPartition,
     BoardReplyByParentCreatedAtKey, BoardReplyByParentCreatedAtPartition,
 };
 use indexer_db::AddressPayload;
@@ -39,6 +40,7 @@ pub struct BoardApi {
     board_reaction_by_post_actor_emoji_partition: BoardReactionByPostActorEmojiPartition,
     board_follow_by_follower_target_partition: BoardFollowByFollowerTargetPartition,
     board_follow_by_target_follower_partition: BoardFollowByTargetFollowerPartition,
+    board_report_by_post_actor_partition: BoardReportByPostActorPartition,
     context: IndexerContext,
     push_service: Option<PushService>,
 }
@@ -53,6 +55,7 @@ impl BoardApi {
         board_reaction_by_post_actor_emoji_partition: BoardReactionByPostActorEmojiPartition,
         board_follow_by_follower_target_partition: BoardFollowByFollowerTargetPartition,
         board_follow_by_target_follower_partition: BoardFollowByTargetFollowerPartition,
+        board_report_by_post_actor_partition: BoardReportByPostActorPartition,
         context: IndexerContext,
         push_service: Option<PushService>,
     ) -> Self {
@@ -65,6 +68,7 @@ impl BoardApi {
             board_reaction_by_post_actor_emoji_partition,
             board_follow_by_follower_target_partition,
             board_follow_by_target_follower_partition,
+            board_report_by_post_actor_partition,
             context,
             push_service,
         }
@@ -80,6 +84,7 @@ impl BoardApi {
             .route("/posts/{post_id}", get(get_board_post_detail))
             .route("/posts/{post_id}/replies", post(create_board_reply))
             .route("/posts/{post_id}/reactions", post(toggle_board_reaction))
+            .route("/posts/{post_id}/report", post(report_board_post))
     }
 }
 
@@ -166,6 +171,19 @@ pub struct BoardCreateFollowRequest {
     pub network: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardCreateReportRequest {
+    pub actor_address: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub created_at: String,
+    pub client_generated_id: String,
+    pub signature: String,
+    pub network: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct BoardCreatePostSignablePayload {
@@ -204,6 +222,16 @@ struct BoardCreateFollowSignablePayload {
     target_avatar_file_id: Option<String>,
     target_avatar_file_extension: Option<String>,
     follow: bool,
+    created_at: String,
+    client_generated_id: String,
+    network: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BoardCreateReportSignablePayload {
+    actor_address: String,
+    reason: String,
     created_at: String,
     client_generated_id: String,
     network: String,
@@ -318,6 +346,16 @@ pub struct BoardFollowMutationResponse {
     pub is_following: bool,
     pub following_count: i32,
     pub follower_count: i32,
+    pub server_time: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardReportMutationResponse {
+    pub post_id: String,
+    pub actor_address: String,
+    pub report_count: i32,
+    pub moderation_state: String,
     pub server_time: String,
 }
 
@@ -642,12 +680,48 @@ pub async fn set_board_follow_state(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/board/posts/{post_id}/report",
+    params(("post_id" = String, Path, description = "Board post id")),
+    request_body = BoardCreateReportRequest,
+    responses(
+        (status = 200, description = "Report a board post", body = BoardReportMutationResponse),
+        (status = 400, description = "Bad request", body = BoardErrorResponse),
+        (status = 404, description = "Post not found", body = BoardErrorResponse),
+        (status = 500, description = "Internal server error", body = BoardErrorResponse)
+    )
+)]
+pub async fn report_board_post(
+    State(state): State<BoardApi>,
+    Path(post_id): Path<String>,
+    Json(request): Json<BoardCreateReportRequest>,
+) -> impl IntoResponse {
+    let normalized_post_id = post_id.trim().to_string();
+    let result = spawn_blocking(move || submit_report_record(&state, normalized_post_id.as_str(), &request)).await;
+
+    match result {
+        Ok(Ok(response)) => Ok(Json(response)),
+        Ok(Err(error)) => Err(status_for_board_error(&error, false)),
+        Err(join_error) => Err(task_error_response(join_error)),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct StoredBoardFollowRecord {
     actor: BoardAuthorResponse,
     target: BoardAuthorResponse,
     created_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct StoredBoardReportRecord {
+    actor_address: String,
+    reason: String,
+    created_at: String,
+    client_generated_id: String,
 }
 
 fn create_post_record(
@@ -790,6 +864,70 @@ fn toggle_reaction_record(
     wtx.commit()?
         .map_err(|_| anyhow::anyhow!("board reaction write conflict"))?;
     Ok(())
+}
+
+fn submit_report_record(
+    state: &BoardApi,
+    post_id: &str,
+    request: &BoardCreateReportRequest,
+) -> anyhow::Result<BoardReportMutationResponse> {
+    validate_create_report_request(request, &state.context)?;
+
+    let normalized_post_id = post_id.trim();
+    let normalized_actor_address = request.actor_address.trim();
+
+    let rtx = state.tx_keyspace.read_tx();
+    let mut post = load_post_response_from_rtx(&rtx, state, normalized_post_id)?;
+    let had_existing_report = state
+        .board_report_by_post_actor_partition
+        .get_rtx(&rtx, normalized_post_id, normalized_actor_address)?
+        .is_some();
+    let current_report_count = count_reports_for_post(
+        &state.board_report_by_post_actor_partition,
+        &rtx,
+        normalized_post_id,
+    )?;
+    drop(rtx);
+
+    let reason = normalized_optional(&Some(request.reason.clone())).unwrap_or_else(|| "user_report".to_string());
+    let created_at = parse_requested_created_at(&request.created_at)?;
+    let stored_record = StoredBoardReportRecord {
+        actor_address: normalized_actor_address.to_string(),
+        reason,
+        created_at: timestamp_string(created_at)?,
+        client_generated_id: request.client_generated_id.trim().to_string(),
+    };
+    let json_bytes = serde_json::to_vec(&stored_record).context("serialize board report")?;
+
+    let mut wtx = state.tx_keyspace.write_tx()?;
+    state.board_report_by_post_actor_partition.insert_wtx(
+        &mut wtx,
+        normalized_post_id,
+        normalized_actor_address,
+        &json_bytes,
+    );
+
+    let report_count = if had_existing_report {
+        current_report_count
+    } else {
+        current_report_count.saturating_add(1)
+    };
+    post.moderation_state = if report_count > 0 {
+        "reported".to_string()
+    } else {
+        "none".to_string()
+    };
+    write_post_response(state, &mut wtx, &post)?;
+    wtx.commit()?
+        .map_err(|_| anyhow::anyhow!("board report write conflict"))?;
+
+    Ok(BoardReportMutationResponse {
+        post_id: normalized_post_id.to_string(),
+        actor_address: normalized_actor_address.to_string(),
+        report_count,
+        moderation_state: post.moderation_state,
+        server_time: timestamp_string(OffsetDateTime::now_utc())?,
+    })
 }
 
 fn apply_follow_state(
@@ -1005,6 +1143,15 @@ fn build_reaction_summary(
             .then_with(|| lhs.emoji.cmp(&rhs.emoji))
     });
     Ok(summary)
+}
+
+fn count_reports_for_post(
+    partition: &BoardReportByPostActorPartition,
+    rtx: &fjall::ReadTransaction,
+    post_id: &str,
+) -> anyhow::Result<i32> {
+    let reports = partition.get_by_post_id(rtx, post_id)?;
+    Ok(i32::try_from(reports.len()).unwrap_or(i32::MAX))
 }
 
 fn count_reactions_for_post(
@@ -1287,6 +1434,41 @@ fn validate_create_follow_request(
         target_avatar_file_id: request.target_avatar_file_id.clone(),
         target_avatar_file_extension: request.target_avatar_file_extension.clone(),
         follow: request.follow,
+        created_at: request.created_at.clone(),
+        client_generated_id: request.client_generated_id.clone(),
+        network: request.network.clone(),
+    };
+    verify_board_signature(
+        request.actor_address.as_str(),
+        canonical_json_bytes(&signable_payload)?.as_slice(),
+        request.signature.as_str(),
+    )?;
+    Ok(())
+}
+
+fn validate_create_report_request(
+    request: &BoardCreateReportRequest,
+    context: &IndexerContext,
+) -> anyhow::Result<()> {
+    validate_board_actor_address("actorAddress", request.actor_address.as_str())?;
+
+    if request.signature.trim().is_empty() {
+        bail!("signature is required");
+    }
+
+    if request.client_generated_id.trim().is_empty() {
+        bail!("clientGeneratedId is required");
+    }
+
+    let reason = request.reason.trim();
+    if reason.chars().count() > 120 {
+        bail!("reason is too long");
+    }
+
+    validate_network(context, request.network.as_str())?;
+    let signable_payload = BoardCreateReportSignablePayload {
+        actor_address: request.actor_address.clone(),
+        reason: request.reason.clone(),
         created_at: request.created_at.clone(),
         client_generated_id: request.client_generated_id.clone(),
         network: request.network.clone(),

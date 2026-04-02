@@ -23,6 +23,7 @@ use indexer_db::messages::board::{
     BoardClientGeneratedIdToPostIdPartition, BoardPostByCreatedAtPartition, BoardPostByIdPartition,
     BoardFollowByFollowerTargetPartition, BoardFollowByTargetFollowerPartition,
     BoardReactionByPostActorEmojiPartition, BoardReplyByParentCreatedAtPartition,
+    BoardReportByPostActorPartition,
 };
 use indexer_db::messages::payment::{
     PaymentByReceiverPartition, PaymentBySenderPartition, TxIdToPaymentPartition,
@@ -104,6 +105,8 @@ async fn main() -> anyhow::Result<()> {
         BoardFollowByFollowerTargetPartition::new(&tx_keyspace)?;
     let board_follow_by_target_follower_partition =
         BoardFollowByTargetFollowerPartition::new(&tx_keyspace)?;
+    let board_report_by_post_actor_partition =
+        BoardReportByPostActorPartition::new(&tx_keyspace)?;
     let tx_id_to_acceptance_partition = TxIDToAcceptancePartition::new(&tx_keyspace)?;
     let block_compact_header_partition = BlockCompactHeaderPartition::new(&tx_keyspace)?;
     let acceptance_to_tx_id_partition = AcceptingBlockToTxIDPartition::new(&tx_keyspace)?;
@@ -289,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
         board_reaction_by_post_actor_emoji_partition,
         board_follow_by_follower_target_partition,
         board_follow_by_target_follower_partition,
+        board_report_by_post_actor_partition,
         gift_api,
         push_api,
         push_service.clone(),

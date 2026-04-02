@@ -351,3 +351,64 @@ impl BoardFollowByTargetFollowerPartition {
         format!("{}|", target_address.trim().to_lowercase())
     }
 }
+
+#[derive(Clone)]
+pub struct BoardReportByPostActorPartition(fjall::TxPartition);
+
+impl BoardReportByPostActorPartition {
+    pub fn new(keyspace: &fjall::TxKeyspace) -> Result<Self> {
+        Ok(Self(keyspace.open_partition(
+            "board_report_by_post_actor",
+            PartitionCreateOptions::default(),
+        )?))
+    }
+
+    pub fn insert_wtx(
+        &self,
+        wtx: &mut WriteTransaction,
+        post_id: &str,
+        actor_address: &str,
+        json_bytes: &[u8],
+    ) {
+        let key = Self::key(post_id, actor_address);
+        wtx.insert(&self.0, key.as_bytes(), json_bytes);
+    }
+
+    pub fn get_rtx(
+        &self,
+        rtx: &ReadTransaction,
+        post_id: &str,
+        actor_address: &str,
+    ) -> Result<Option<SharedImmutable<[u8]>>> {
+        let key = Self::key(post_id, actor_address);
+        rtx.get(&self.0, key.as_bytes())
+            .map(|value| value.map(SharedImmutable::new))
+            .map_err(anyhow::Error::from)
+    }
+
+    pub fn get_by_post_id(
+        &self,
+        rtx: &ReadTransaction,
+        post_id: &str,
+    ) -> Result<Vec<(SharedImmutable<[u8]>, SharedImmutable<[u8]>)>> {
+        let prefix = Self::post_prefix(post_id);
+        rtx.prefix(&self.0, prefix.as_bytes())
+            .map(|item| {
+                let (key, value) = item?;
+                Ok((SharedImmutable::new(key), SharedImmutable::new(value)))
+            })
+            .collect()
+    }
+
+    fn key(post_id: &str, actor_address: &str) -> String {
+        format!(
+            "{}|{}",
+            post_id.trim(),
+            actor_address.trim().to_lowercase()
+        )
+    }
+
+    fn post_prefix(post_id: &str) -> String {
+        format!("{}|", post_id.trim())
+    }
+}

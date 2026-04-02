@@ -16,6 +16,7 @@ use indexer_db::messages::board::{
     BoardClientGeneratedIdToPostIdPartition, BoardPostByCreatedAtPartition, BoardPostByIdPartition,
     BoardFollowByFollowerTargetPartition, BoardFollowByTargetFollowerPartition,
     BoardReactionByPostActorEmojiPartition, BoardReplyByParentCreatedAtPartition,
+    BoardReportByPostActorPartition,
 };
 use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
@@ -65,13 +66,14 @@ pub mod self_stash;
         crate::api::board::create_board_post,
         crate::api::board::create_board_reply,
         crate::api::board::toggle_board_reaction,
+        crate::api::board::report_board_post,
         crate::api::board::set_board_follow_state,
         self_stash::get_self_stash_by_owner,
         self_stash::get_self_stash_by_scope,
         get_metrics,
     ),
     components(
-        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, gift::GiftChallengeResponse, gift::GiftClaimRequest, gift::GiftClaimResponse, gift::GiftDeviceCheckDebugQueryRequest, gift::GiftDeviceCheckDebugQueryResponse, gift::GiftDeviceCheckDebugUpdateRequest, gift::GiftDeviceCheckDebugUpdateResponse, gift::GiftErrorResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, crate::api::board::BoardFeedResponse, crate::api::board::BoardPostResponse, crate::api::board::BoardPostDetailResponse, crate::api::board::BoardCreatePostRequest, crate::api::board::BoardCreateReactionRequest, crate::api::board::BoardCreateFollowRequest, crate::api::board::BoardAuthorResponse, crate::api::board::BoardAttachmentPayload, crate::api::board::BoardLinkPreviewResponse, crate::api::board::BoardReactionSummaryResponse, crate::api::board::BoardErrorResponse, crate::api::board::BoardProfileConnectionsResponse, crate::api::board::BoardFollowMutationResponse, IndexerMetricsSnapshot)
+        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, gift::GiftChallengeResponse, gift::GiftClaimRequest, gift::GiftClaimResponse, gift::GiftDeviceCheckDebugQueryRequest, gift::GiftDeviceCheckDebugQueryResponse, gift::GiftDeviceCheckDebugUpdateRequest, gift::GiftDeviceCheckDebugUpdateResponse, gift::GiftErrorResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, crate::api::board::BoardFeedResponse, crate::api::board::BoardPostResponse, crate::api::board::BoardPostDetailResponse, crate::api::board::BoardCreatePostRequest, crate::api::board::BoardCreateReactionRequest, crate::api::board::BoardCreateFollowRequest, crate::api::board::BoardCreateReportRequest, crate::api::board::BoardAuthorResponse, crate::api::board::BoardAttachmentPayload, crate::api::board::BoardLinkPreviewResponse, crate::api::board::BoardReactionSummaryResponse, crate::api::board::BoardErrorResponse, crate::api::board::BoardProfileConnectionsResponse, crate::api::board::BoardFollowMutationResponse, crate::api::board::BoardReportMutationResponse, IndexerMetricsSnapshot)
     ),
     tags(
         (name = "Kasia Indexer API", description = "Kasia Indexer API")
@@ -114,6 +116,7 @@ impl Api {
         board_reaction_by_post_actor_emoji_partition: BoardReactionByPostActorEmojiPartition,
         board_follow_by_follower_target_partition: BoardFollowByFollowerTargetPartition,
         board_follow_by_target_follower_partition: BoardFollowByTargetFollowerPartition,
+        board_report_by_post_actor_partition: BoardReportByPostActorPartition,
         gift_api: GiftApi,
         push_api: PushApi,
         push_service: PushService,
@@ -164,6 +167,7 @@ impl Api {
             board_reaction_by_post_actor_emoji_partition,
             board_follow_by_follower_target_partition,
             board_follow_by_target_follower_partition,
+            board_report_by_post_actor_partition,
             context,
             Some(push_service),
         );

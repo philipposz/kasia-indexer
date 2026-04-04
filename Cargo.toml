@@ -24,9 +24,11 @@ futures-util = "0.3.31"
 #kaspa-wrpc-client = "1.*"
 kaspa-addresses = "1.1.0-rc.2"
 kaspa-consensus-core = "1.1.0-rc.2"
+kaspa-grpc-core = "1.1.0-rc.2"
 kaspa-rpc-core = "1.1.0-rc.2"
 kaspa-txscript = "1.1.0-rc.2"
 kaspa-wrpc-client = "1.1.0-rc.2"
+prost = "0.13.5"
 rayon = "1.11.0"
 ringmap = "0.1.4"
 rolling-file = "0.2.0"
@@ -62,6 +64,7 @@ indexer-db = { path = "indexer-db" }
 [patch.crates-io]
 kaspa-addresses = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0-rc.2" }
 kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0-rc.2" }
+kaspa-grpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0-rc.2" }
 kaspa-math = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0-rc.2" }
 kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0-rc.2" }
 kaspa-txscript = { git = "https://github.com/kaspanet/rusty-kaspa.git", tag = "v1.1.0-rc.2" }

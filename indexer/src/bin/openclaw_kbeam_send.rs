@@ -40,6 +40,7 @@ struct Config {
     contextual_payload: Option<String>,
     handshake_encrypted_hex: Option<String>,
     node_url: Option<String>,
+    fee_multiplier: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,9 +52,18 @@ struct SendOutput {
     total_input_amount: u64,
     output_amount: u64,
     fee: u64,
+    fee_multiplier: f64,
+    fee_reason: String,
+    mempool_size_hint: Option<u64>,
     compute_mass: u64,
     transient_mass: u64,
     storage_mass: u64,
+}
+
+#[derive(Clone)]
+struct FeeDecision {
+    multiplier: f64,
+    reason: String,
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +92,9 @@ const FEE_BUFFER_SOMPI: u64 = 3;
 const MINIMUM_RELAY_FEE: u64 = 1_000;
 const HANDSHAKE_AMOUNT_SOMPI: u64 = 20_000_000;
 const DUST_THRESHOLD_SOMPI: u64 = 10_000;
+const DEFAULT_ADAPTIVE_FEE_MAX_MULTIPLIER: f64 = 5.0;
+const DEFAULT_PROACTIVE_FEE_BOOST_PERCENTAGE: f64 = 30.0;
+const DEFAULT_PROACTIVE_FEE_BOOST_MEMPOOL_THRESHOLD: u64 = 1_000;
 
 const SECP256K1_N: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
@@ -125,6 +138,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!("connect wRPC client: {error}"))?;
     wait_for_rpc_connection(&rpc_client).await?;
+    let mempool_size_hint = fetch_mempool_size_hint(&rpc_client).await;
+    let fee_decision = fee_decision(mempool_size_hint, config.fee_multiplier);
 
     let send_result = if let Some(contextual_payload) = config.contextual_payload.as_ref() {
         send_contextual_message(
@@ -133,6 +148,8 @@ async fn main() -> anyhow::Result<()> {
             &sender_address,
             contextual_payload.as_bytes(),
             parse_consensus_network(&config.network)?,
+            &fee_decision,
+            mempool_size_hint,
         )
         .await
     } else {
@@ -149,6 +166,8 @@ async fn main() -> anyhow::Result<()> {
                 "missing --handshake-encrypted-hex for handshake send",
             )?,
             parse_consensus_network(&config.network)?,
+            &fee_decision,
+            mempool_size_hint,
         )
         .await
     };
@@ -173,6 +192,7 @@ impl Config {
         let mut handshake_encrypted_hex = None;
         let mut recipient_address = None;
         let mut node_url = env_value("OPENCLAW_KBEAM_NODE_URL");
+        let mut fee_multiplier = env_f64("OPENCLAW_KBEAM_FEE_MULTIPLIER");
 
         while let Some(flag) = args.next() {
             match flag.as_str() {
@@ -195,6 +215,13 @@ impl Config {
                     handshake_encrypted_hex = Some(required_arg_value(&flag, args.next())?)
                 }
                 "--node-url" => node_url = Some(required_arg_value(&flag, args.next())?),
+                "--fee-multiplier" => {
+                    fee_multiplier = Some(
+                        required_arg_value(&flag, args.next())?
+                            .parse()
+                            .context("parse --fee-multiplier")?
+                    )
+                }
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -226,6 +253,7 @@ impl Config {
             contextual_payload,
             handshake_encrypted_hex,
             node_url: normalized_optional(node_url),
+            fee_multiplier,
         })
     }
 }
@@ -236,6 +264,8 @@ async fn send_contextual_message(
     sender_address: &str,
     payload: &[u8],
     network: ConsensusNetworkType,
+    fee_decision: &FeeDecision,
+    mempool_size_hint: Option<u64>,
 ) -> anyhow::Result<SendOutput> {
     let sender_rpc_address = kaspa_rpc_core::RpcAddress::try_from(sender_address)
         .with_context(|| format!("parse sender address {sender_address}"))?;
@@ -265,7 +295,13 @@ async fn send_contextual_message(
 
     let params = Params::from(network);
     let mass_calculator = MassCalculator::new_with_consensus_params(&params);
-    let estimated = estimate_contextual_self_spend(&spendable, &sender_spk, payload, &mass_calculator)?;
+    let estimated = estimate_contextual_self_spend(
+        &spendable,
+        &sender_spk,
+        payload,
+        &mass_calculator,
+        fee_decision.multiplier,
+    )?;
 
     let mut signed = sign_with_multiple_v2(
         MutableTransaction::with_entries(
@@ -291,6 +327,9 @@ async fn send_contextual_message(
         total_input_amount: estimated.total_input_amount,
         output_amount: estimated.output_amount,
         fee: estimated.fee,
+        fee_multiplier: fee_decision.multiplier,
+        fee_reason: fee_decision.reason.clone(),
+        mempool_size_hint,
         compute_mass: estimated.non_contextual.compute_mass,
         transient_mass: estimated.non_contextual.transient_mass,
         storage_mass: estimated.contextual.storage_mass,
@@ -304,6 +343,8 @@ async fn send_handshake_response(
     recipient_address: &str,
     encrypted_hex: &str,
     network: ConsensusNetworkType,
+    fee_decision: &FeeDecision,
+    mempool_size_hint: Option<u64>,
 ) -> anyhow::Result<SendOutput> {
     let sender_rpc_address = kaspa_rpc_core::RpcAddress::try_from(sender_address)
         .with_context(|| format!("parse sender address {sender_address}"))?;
@@ -340,7 +381,14 @@ async fn send_handshake_response(
     let params = Params::from(network);
     let mass_calculator = MassCalculator::new_with_consensus_params(&params);
     let estimated =
-        estimate_handshake_response(&spendable, &sender_spk, &recipient_spk, &payload, &mass_calculator)?;
+        estimate_handshake_response(
+            &spendable,
+            &sender_spk,
+            &recipient_spk,
+            &payload,
+            &mass_calculator,
+            fee_decision.multiplier,
+        )?;
 
     let mut signed = sign_with_multiple_v2(
         MutableTransaction::with_entries(
@@ -366,10 +414,85 @@ async fn send_handshake_response(
         total_input_amount: estimated.total_input_amount,
         output_amount: HANDSHAKE_AMOUNT_SOMPI,
         fee: estimated.fee,
+        fee_multiplier: fee_decision.multiplier,
+        fee_reason: fee_decision.reason.clone(),
+        mempool_size_hint,
         compute_mass: estimated.non_contextual.compute_mass,
         transient_mass: estimated.non_contextual.transient_mass,
         storage_mass: estimated.contextual.storage_mass,
     })
+}
+
+async fn fetch_mempool_size_hint(rpc_client: &KaspaRpcClient) -> Option<u64> {
+    rpc_client.get_info().await.ok().map(|info| info.mempool_size)
+}
+
+fn fee_decision(mempool_size_hint: Option<u64>, override_multiplier: Option<f64>) -> FeeDecision {
+    if let Some(multiplier) = override_multiplier {
+        return FeeDecision {
+            multiplier: normalize_fee_multiplier(multiplier),
+            reason: "manual_override".to_string(),
+        };
+    }
+
+    let congestion = congestion_multiplier(mempool_size_hint);
+    let proactive = proactive_fee_boost_multiplier(mempool_size_hint);
+    let mut multiplier = 1.0f64;
+    let mut reasons: Vec<&str> = Vec::new();
+
+    if congestion > multiplier {
+        multiplier = congestion;
+        reasons.push("congestion");
+    }
+
+    if let Some(proactive_multiplier) = proactive {
+        if proactive_multiplier > multiplier {
+            multiplier = proactive_multiplier;
+        }
+        reasons.push("proactive_mempool_boost");
+    }
+
+    multiplier = normalize_fee_multiplier(multiplier);
+
+    FeeDecision {
+        multiplier,
+        reason: if reasons.is_empty() {
+            "base".to_string()
+        } else {
+            reasons.join("+")
+        },
+    }
+}
+
+fn normalize_fee_multiplier(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 1.0;
+    }
+    let stepped = (value * 20.0).round() / 20.0;
+    stepped.clamp(1.0, DEFAULT_ADAPTIVE_FEE_MAX_MULTIPLIER)
+}
+
+fn proactive_fee_boost_multiplier(mempool_size_hint: Option<u64>) -> Option<f64> {
+    let mempool_size_hint = mempool_size_hint?;
+    if mempool_size_hint < DEFAULT_PROACTIVE_FEE_BOOST_MEMPOOL_THRESHOLD {
+        return None;
+    }
+    Some(1.0 + (DEFAULT_PROACTIVE_FEE_BOOST_PERCENTAGE / 100.0))
+}
+
+fn congestion_multiplier(mempool_size_hint: Option<u64>) -> f64 {
+    let Some(mempool_size_hint) = mempool_size_hint else {
+        return 1.0;
+    };
+
+    match mempool_size_hint {
+        0..=999 => 1.0,
+        1_000..=4_999 => 1.1,
+        5_000..=14_999 => 1.25,
+        15_000..=49_999 => 1.5,
+        50_000..=99_999 => 2.0,
+        _ => 2.5,
+    }
 }
 
 async fn wait_for_rpc_connection(rpc_client: &KaspaRpcClient) -> anyhow::Result<()> {
@@ -414,6 +537,7 @@ fn estimate_contextual_self_spend(
     sender_spk: &kaspa_consensus_core::tx::ScriptPublicKey,
     payload: &[u8],
     mass_calculator: &MassCalculator,
+    fee_multiplier: f64,
 ) -> anyhow::Result<EstimatedTransaction> {
     let mut selected = Vec::new();
     let mut total_input_amount = 0u64;
@@ -425,7 +549,14 @@ fn estimate_contextual_self_spend(
         selected.push(utxo.clone());
 
         if let Some(estimated) =
-            try_estimate_contextual_self_spend(&selected, total_input_amount, sender_spk, payload, mass_calculator)?
+            try_estimate_contextual_self_spend(
+                &selected,
+                total_input_amount,
+                sender_spk,
+                payload,
+                mass_calculator,
+                fee_multiplier,
+            )?
         {
             return Ok(estimated);
         }
@@ -440,6 +571,7 @@ fn estimate_handshake_response(
     recipient_spk: &kaspa_consensus_core::tx::ScriptPublicKey,
     payload: &[u8],
     mass_calculator: &MassCalculator,
+    fee_multiplier: f64,
 ) -> anyhow::Result<EstimatedTransaction> {
     let mut selected = Vec::new();
     let mut total_input_amount = 0u64;
@@ -457,6 +589,7 @@ fn estimate_handshake_response(
             recipient_spk,
             payload,
             mass_calculator,
+            fee_multiplier,
         )? {
             return Ok(estimated);
         }
@@ -471,6 +604,7 @@ fn try_estimate_contextual_self_spend(
     sender_spk: &kaspa_consensus_core::tx::ScriptPublicKey,
     payload: &[u8],
     mass_calculator: &MassCalculator,
+    fee_multiplier: f64,
 ) -> anyhow::Result<Option<EstimatedTransaction>> {
     let mut fee = MINIMUM_RELAY_FEE;
 
@@ -491,7 +625,10 @@ fn try_estimate_contextual_self_spend(
             .context("calculate contextual mass")?;
         tx.set_mass(contextual.storage_mass);
         let non_contextual = mass_calculator.calc_non_contextual_masses(&tx);
-        let required_fee = contextual.max(non_contextual).max(MINIMUM_RELAY_FEE) + FEE_BUFFER_SOMPI;
+        let required_fee = adjusted_fee(
+            contextual.max(non_contextual).max(MINIMUM_RELAY_FEE),
+            fee_multiplier,
+        );
 
         if required_fee == fee {
             return Ok(Some(EstimatedTransaction {
@@ -517,6 +654,7 @@ fn try_estimate_handshake_response(
     recipient_spk: &kaspa_consensus_core::tx::ScriptPublicKey,
     payload: &[u8],
     mass_calculator: &MassCalculator,
+    fee_multiplier: f64,
 ) -> anyhow::Result<Option<EstimatedTransaction>> {
     let mut fee = MINIMUM_RELAY_FEE;
 
@@ -538,7 +676,10 @@ fn try_estimate_handshake_response(
             .context("calculate contextual mass")?;
         tx.set_mass(contextual.storage_mass);
         let non_contextual = mass_calculator.calc_non_contextual_masses(&tx);
-        let required_fee = contextual.max(non_contextual).max(MINIMUM_RELAY_FEE) + FEE_BUFFER_SOMPI;
+        let required_fee = adjusted_fee(
+            contextual.max(non_contextual).max(MINIMUM_RELAY_FEE),
+            fee_multiplier,
+        );
 
         if required_fee == fee {
             return Ok(Some(EstimatedTransaction {
@@ -580,6 +721,18 @@ fn build_estimation_transaction_with_outputs(
         .map(|utxo| TransactionInput::new(utxo.outpoint, vec![0u8; 66], 0, 1))
         .collect::<Vec<_>>();
     Transaction::new_non_finalized(0, inputs, outputs, 0, SUBNETWORK_ID_NATIVE, 0, payload.to_vec())
+}
+
+fn adjusted_fee(base_fee: u64, fee_multiplier: f64) -> u64 {
+    let normalized_multiplier = if fee_multiplier.is_finite() {
+        fee_multiplier.max(1.0)
+    } else {
+        1.0
+    };
+    let scaled_double = (base_fee as f64) * normalized_multiplier;
+    let bounded_scaled = scaled_double.min((u64::MAX - FEE_BUFFER_SOMPI) as f64);
+    let scaled = bounded_scaled.ceil() as u64;
+    scaled.saturating_add(FEE_BUFFER_SOMPI)
 }
 
 fn spendable_entries(selected: &[SelectedUtxo]) -> Vec<UtxoEntry> {
@@ -765,6 +918,10 @@ fn env_u32(key: &str) -> Option<u32> {
     env_value(key).and_then(|value| value.parse().ok())
 }
 
+fn env_f64(key: &str) -> Option<f64> {
+    env_value(key).and_then(|value| value.parse().ok())
+}
+
 fn normalized_optional(value: Option<String>) -> Option<String> {
     value.map(|inner| inner.trim().to_string()).filter(|inner| !inner.is_empty())
 }
@@ -824,6 +981,7 @@ fn print_help() {
            --network mainnet             or OPENCLAW_KBEAM_NETWORK\n\
            --account-index 0             or OPENCLAW_KBEAM_ACCOUNT_INDEX\n\
            --address-index 1             or OPENCLAW_KBEAM_ADDRESS_INDEX\n\
+           --fee-multiplier 1.30         or OPENCLAW_KBEAM_FEE_MULTIPLIER\n\
            --sender-address kaspa:...    verify derived wallet matches this address\n\
            --recipient-address kaspa:... recipient for handshake response mode\n\
            --node-url wss://...          use explicit wRPC endpoint instead of resolver\n"

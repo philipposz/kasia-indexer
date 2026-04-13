@@ -1,11 +1,11 @@
 use crate::push::{PushApiError, PushService};
-use axum::extract::State;
-use axum::routing::{delete, post, put};
+use axum::extract::{Query, State};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 
 pub use crate::push::{
     PushChallengeResponse, PushErrorResponse, PushOkResponse, PushRegistrationRequest,
-    PushUnregisterRequest, PushUpdateRequest,
+    PushPeerStatusQuery, PushPeerStatusResponse, PushUnregisterRequest, PushUpdateRequest,
 };
 
 #[derive(Clone)]
@@ -24,6 +24,7 @@ impl PushApi {
             .route("/register", post(register_device))
             .route("/update", put(update_device))
             .route("/unregister", delete(unregister_device))
+            .route("/status/by-wallet-address", get(peer_status_by_wallet_address))
     }
 }
 
@@ -112,4 +113,28 @@ pub async fn unregister_device(
         .map_err(PushApiError::into_response)?;
 
     Ok(Json(PushOkResponse { ok: true }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/push/status/by-wallet-address",
+    params(
+        ("wallet_address" = String, Query, description = "Kaspa wallet address of the contact")
+    ),
+    responses(
+        (status = 200, description = "Peer push registration status", body = PushPeerStatusResponse),
+        (status = 400, description = "Bad request", body = PushErrorResponse),
+        (status = 500, description = "Internal server error", body = PushErrorResponse)
+    )
+)]
+pub async fn peer_status_by_wallet_address(
+    State(state): State<PushApi>,
+    Query(query): Query<PushPeerStatusQuery>,
+) -> Result<Json<PushPeerStatusResponse>, (axum::http::StatusCode, Json<PushErrorResponse>)> {
+    state
+        .service
+        .peer_status_for_wallet_address(query.wallet_address.as_str())
+        .await
+        .map(Json)
+        .map_err(PushApiError::into_response)
 }

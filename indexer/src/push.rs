@@ -238,6 +238,21 @@ pub struct PushChallengeResponse {
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
+pub struct PushPeerStatusQuery {
+    pub wallet_address: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct PushPeerStatusResponse {
+    pub wallet_address: String,
+    pub registered: bool,
+    pub last_seen_ms: Option<u64>,
+    pub device_count: usize,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub struct PushRegistrationRequest {
     pub device_token: String,
     pub token_type: String,
@@ -840,6 +855,61 @@ impl PushService {
             .map_err(|error| {
                 PushApiError::internal(format!("failed to persist registrations: {error}"))
             })
+    }
+
+    pub async fn peer_status_for_wallet_address(
+        &self,
+        wallet_address: &str,
+    ) -> Result<PushPeerStatusResponse, PushApiError> {
+        let normalized_wallet_address = normalize_address(wallet_address)
+            .ok_or_else(|| PushApiError::bad_request("invalid wallet address"))?;
+        let now = now_ms();
+        let active_window_ms = read_env_u64(
+            "PUSH_STATUS_ACTIVE_WINDOW_MS",
+            45 * 24 * 60 * 60 * 1000,
+        );
+        let configured_bundle_id = self
+            .config
+            .apns_bundle_id
+            .as_deref()
+            .and_then(normalize_bundle_id)
+            .or_else(|| normalize_bundle_id("com.kbeam.app"));
+
+        let registrations = self.registrations.read().await;
+        let matching_registrations = registrations
+            .values()
+            .filter(|registration| registration.token_type == "apns")
+            .filter(|registration| {
+                if let Some(required_bundle_id) = configured_bundle_id.as_deref() {
+                    registration.app_bundle_id.as_deref() == Some(required_bundle_id)
+                } else {
+                    true
+                }
+            })
+            .filter(|registration| {
+                registration.wallet_address == normalized_wallet_address
+                    || registration.primary_address.as_deref()
+                        == Some(normalized_wallet_address.as_str())
+            })
+            .collect::<Vec<_>>();
+
+        let last_seen_ms = matching_registrations
+            .iter()
+            .map(|registration| registration.updated_at_ms)
+            .max();
+        let device_count = matching_registrations
+            .iter()
+            .filter(|registration| {
+                now.saturating_sub(registration.updated_at_ms) <= active_window_ms
+            })
+            .count();
+
+        Ok(PushPeerStatusResponse {
+            wallet_address: normalized_wallet_address,
+            registered: device_count > 0,
+            last_seen_ms,
+            device_count,
+        })
     }
 
     pub async fn dispatch_pulse_reply(&self, event: PulseReplyPushEvent) -> anyhow::Result<()> {

@@ -2,8 +2,8 @@ use crate::context::IndexerContext;
 use crate::push::{PulseReplyPushEvent, PushService};
 use anyhow::{Context, bail};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use indexer_db::messages::board::{
@@ -20,6 +20,7 @@ use secp256k1::ffi;
 use secp256k1::ffi::CPtr;
 use secp256k1::{Secp256k1, XOnlyPublicKey, schnorr};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use time::Duration;
@@ -77,6 +78,7 @@ impl BoardApi {
     pub fn router() -> Router<Self> {
         Router::new()
             .route("/feed", get(get_board_feed))
+            .route("/feed/changes", get(get_board_feed_changes))
             .route("/posts", post(create_board_post))
             .route("/profile/{address}", get(get_board_profile_feed))
             .route("/profile/{address}/connections", get(get_board_profile_connections))
@@ -93,6 +95,14 @@ pub struct BoardFeedQuery {
     pub mode: Option<String>,
     pub limit: Option<usize>,
     pub cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardFeedChangesQuery {
+    pub mode: Option<String>,
+    pub limit: Option<usize>,
+    pub since_revision: String,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -307,6 +317,8 @@ pub struct BoardPostResponse {
     pub reaction_count: i32,
     pub visibility_state: String,
     pub moderation_state: String,
+    pub revision_token: Option<String>,
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
@@ -324,6 +336,28 @@ pub struct BoardFeedResponse {
     pub items: Vec<BoardPostResponse>,
     pub next_cursor: Option<String>,
     pub server_time: String,
+    pub feed_revision: Option<String>,
+    pub page_digest: Option<String>,
+    pub supports_changes_since_revision: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardFeedChangeResponse {
+    pub operation: String,
+    pub post_id: String,
+    pub post: Option<BoardPostResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardFeedChangesResponse {
+    pub base_revision: String,
+    pub target_revision: String,
+    pub next_cursor: Option<String>,
+    pub server_time: String,
+    pub requires_full_reload: bool,
+    pub changes: Vec<BoardFeedChangeResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
@@ -364,20 +398,32 @@ pub struct BoardErrorResponse {
     pub error: String,
 }
 
+enum BoardFeedLoadResult {
+    NotModified { revision: String },
+    Feed(BoardFeedResponse),
+}
+
+enum BoardFeedChangesLoadResult {
+    NotModified { revision: String },
+    Changes(BoardFeedChangesResponse),
+}
+
 #[utoipa::path(
     get,
     path = "/board/feed",
     params(BoardFeedQuery),
     responses(
         (status = 200, description = "Get board feed", body = BoardFeedResponse),
+        (status = 304, description = "Feed unchanged"),
         (status = 400, description = "Bad request", body = BoardErrorResponse),
         (status = 500, description = "Internal server error", body = BoardErrorResponse)
     )
 )]
 pub async fn get_board_feed(
     State(state): State<BoardApi>,
+    headers: HeaderMap,
     Query(query): Query<BoardFeedQuery>,
-) -> impl IntoResponse {
+) -> Result<Response, (StatusCode, Json<BoardErrorResponse>)> {
     let mode = query
         .mode
         .as_deref()
@@ -395,45 +441,85 @@ pub async fn get_board_feed(
 
     let limit = query.limit.unwrap_or(25).clamp(1, 100);
     let cursor_ms = query.cursor.as_deref().and_then(|value| value.parse::<u64>().ok());
+    let if_none_match_revision = normalized_revision_value_from_headers(&headers);
 
-    let result = spawn_blocking(move || -> anyhow::Result<BoardFeedResponse> {
-        let rtx = state.tx_keyspace.read_tx();
-        let mut items = Vec::with_capacity(limit);
-
-        for entry in state.board_post_by_created_at_partition.iter_all(&rtx).rev() {
-            let (key, value) = entry?;
-            let created_at_ms = key.created_at_ms.get();
-            if let Some(cursor_ms) = cursor_ms
-                && created_at_ms >= cursor_ms
-            {
-                continue;
-            }
-
-            let post: BoardPostResponse =
-                serde_json::from_slice(value.as_ref()).context("decode board post from feed")?;
-            items.push(post);
-
-            if items.len() >= limit {
-                break;
-            }
-        }
-
-        let next_cursor = items.last().and_then(|post| {
-            parse_timestamp_ms(&post.created_at)
-                .ok()
-                .map(|value| value.to_string())
-        });
-
-        Ok(BoardFeedResponse {
-            items,
-            next_cursor,
-            server_time: timestamp_string(OffsetDateTime::now_utc())?,
-        })
-    })
+    let result = spawn_blocking(move || build_feed_response(&state, limit, cursor_ms, if_none_match_revision))
     .await;
 
     match result {
-        Ok(Ok(feed)) => Ok(Json(feed)),
+        Ok(Ok(BoardFeedLoadResult::NotModified { revision })) => {
+            let mut headers = feed_transport_headers(revision.as_str(), true)
+                .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            headers.insert("content-length", HeaderValue::from_static("0"));
+            Ok((StatusCode::NOT_MODIFIED, headers).into_response())
+        }
+        Ok(Ok(BoardFeedLoadResult::Feed(feed))) => {
+            let revision = feed_revision_value(&feed)
+                .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            let headers = feed_transport_headers(revision.as_str(), feed.supports_changes_since_revision)
+                .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            Ok((headers, Json(feed)).into_response())
+        }
+        Ok(Err(error)) => Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, error)),
+        Err(join_error) => Err(task_error_response(join_error)),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/board/feed/changes",
+    params(BoardFeedChangesQuery),
+    responses(
+        (status = 200, description = "Get incremental Pulse feed changes", body = BoardFeedChangesResponse),
+        (status = 304, description = "Feed unchanged"),
+        (status = 400, description = "Bad request", body = BoardErrorResponse),
+        (status = 500, description = "Internal server error", body = BoardErrorResponse)
+    )
+)]
+pub async fn get_board_feed_changes(
+    State(state): State<BoardApi>,
+    Query(query): Query<BoardFeedChangesQuery>,
+) -> Result<Response, (StatusCode, Json<BoardErrorResponse>)> {
+    let mode = query
+        .mode
+        .as_deref()
+        .unwrap_or("latest")
+        .trim()
+        .to_lowercase();
+    if mode != "latest" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(BoardErrorResponse {
+                error: format!("unsupported board feed mode: {mode}"),
+            }),
+        ));
+    }
+
+    let limit = query.limit.unwrap_or(25).clamp(1, 100);
+    let since_revision = normalize_revision_value(query.since_revision.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(BoardErrorResponse {
+                    error: "sinceRevision is required".to_string(),
+                }),
+            )
+        })?;
+
+    let result = spawn_blocking(move || build_feed_changes_response(&state, limit, since_revision.as_str())).await;
+    match result {
+        Ok(Ok(BoardFeedChangesLoadResult::NotModified { revision })) => {
+            let mut headers = feed_transport_headers(revision.as_str(), true)
+                .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            headers.insert("content-length", HeaderValue::from_static("0"));
+            Ok((StatusCode::NOT_MODIFIED, headers).into_response())
+        }
+        Ok(Ok(BoardFeedChangesLoadResult::Changes(response))) => {
+            let headers = feed_transport_headers(response.target_revision.as_str(), true)
+                .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+            Ok((headers, Json(response)).into_response())
+        }
         Ok(Err(error)) => Err(error_response(StatusCode::INTERNAL_SERVER_ERROR, error)),
         Err(join_error) => Err(task_error_response(join_error)),
     }
@@ -476,11 +562,16 @@ pub async fn get_board_profile_feed(
             }
         }
 
-        Ok(BoardFeedResponse {
+        let mut response = BoardFeedResponse {
             items,
             next_cursor: None,
             server_time: timestamp_string(OffsetDateTime::now_utc())?,
-        })
+            feed_revision: None,
+            page_digest: None,
+            supports_changes_since_revision: false,
+        };
+        apply_feed_metadata(&mut response)?;
+        Ok(response)
     })
     .await;
 
@@ -781,10 +872,12 @@ fn create_post_record(
         reaction_count: 0,
         visibility_state: "visible".to_string(),
         moderation_state: "none".to_string(),
+        revision_token: None,
+        updated_at: None,
     };
 
     let mut wtx = state.tx_keyspace.write_tx()?;
-    write_post_response(state, &mut wtx, &response)?;
+    let _ = write_post_response_with_touch(state, &mut wtx, &response, false)?;
     state.board_client_generated_id_to_post_id_partition.insert_wtx(
         &mut wtx,
         request.client_generated_id.trim(),
@@ -808,7 +901,7 @@ fn create_post_record(
     wtx.commit()?
         .map_err(|_| anyhow::anyhow!("board post write conflict"))?;
 
-    Ok(response)
+    load_post_response(state, post_id_string.as_str())
 }
 
 fn toggle_reaction_record(
@@ -917,7 +1010,7 @@ fn submit_report_record(
     } else {
         "none".to_string()
     };
-    write_post_response(state, &mut wtx, &post)?;
+    let _ = write_post_response_with_touch(state, &mut wtx, &post, true)?;
     wtx.commit()?
         .map_err(|_| anyhow::anyhow!("board report write conflict"))?;
 
@@ -1145,6 +1238,276 @@ fn build_reaction_summary(
     Ok(summary)
 }
 
+fn build_feed_response(
+    state: &BoardApi,
+    limit: usize,
+    cursor_ms: Option<u64>,
+    if_none_match_revision: Option<String>,
+) -> anyhow::Result<BoardFeedLoadResult> {
+    let rtx = state.tx_keyspace.read_tx();
+    let mut items = Vec::with_capacity(limit);
+
+    for entry in state.board_post_by_created_at_partition.iter_all(&rtx).rev() {
+        let (key, value) = entry?;
+        let created_at_ms = key.created_at_ms.get();
+        if let Some(cursor_ms) = cursor_ms
+            && created_at_ms >= cursor_ms
+        {
+            continue;
+        }
+
+        let post: BoardPostResponse =
+            serde_json::from_slice(value.as_ref()).context("decode board post from feed")?;
+        items.push(post);
+
+        if items.len() >= limit {
+            break;
+        }
+    }
+
+    let next_cursor = items.last().and_then(|post| {
+        parse_timestamp_ms(&post.created_at)
+            .ok()
+            .map(|value| value.to_string())
+    });
+
+    let mut response = BoardFeedResponse {
+        items,
+        next_cursor,
+        server_time: timestamp_string(OffsetDateTime::now_utc())?,
+        feed_revision: None,
+        page_digest: None,
+        supports_changes_since_revision: true,
+    };
+    apply_feed_metadata(&mut response)?;
+
+    let revision = feed_revision_value(&response)?;
+    if if_none_match_revision
+        .as_deref()
+        .is_some_and(|candidate| candidate == revision)
+    {
+        return Ok(BoardFeedLoadResult::NotModified { revision });
+    }
+
+    Ok(BoardFeedLoadResult::Feed(response))
+}
+
+fn build_feed_changes_response(
+    state: &BoardApi,
+    limit: usize,
+    since_revision: &str,
+) -> anyhow::Result<BoardFeedChangesLoadResult> {
+    let current_feed = match build_feed_response(state, limit, None, None)? {
+        BoardFeedLoadResult::NotModified { revision: _ } => unreachable!("not modified without conditional request"),
+        BoardFeedLoadResult::Feed(feed) => feed,
+    };
+
+    let target_revision = feed_revision_value(&current_feed)?;
+    if normalize_revision_value(since_revision).as_deref() == Some(target_revision.as_str()) {
+        return Ok(BoardFeedChangesLoadResult::NotModified {
+            revision: target_revision,
+        });
+    }
+
+    let base_cutoff_ms = match parse_feed_revision_cutoff_ms(since_revision) {
+        Some(value) => value,
+        None => {
+            return Ok(BoardFeedChangesLoadResult::Changes(BoardFeedChangesResponse {
+                base_revision: since_revision.to_string(),
+                target_revision,
+                next_cursor: current_feed.next_cursor.clone(),
+                server_time: current_feed.server_time.clone(),
+                requires_full_reload: true,
+                changes: Vec::new(),
+            }));
+        }
+    };
+
+    let mut changes = Vec::new();
+    for post in &current_feed.items {
+        let updated_at_ms = board_post_updated_at_ms(post).unwrap_or_default();
+        if updated_at_ms > base_cutoff_ms {
+            changes.push(BoardFeedChangeResponse {
+                operation: "upsert".to_string(),
+                post_id: post.id.clone(),
+                post: Some(post.clone()),
+            });
+        }
+    }
+
+    if changes.is_empty() {
+        return Ok(BoardFeedChangesLoadResult::Changes(BoardFeedChangesResponse {
+            base_revision: since_revision.to_string(),
+            target_revision,
+            next_cursor: current_feed.next_cursor.clone(),
+            server_time: current_feed.server_time.clone(),
+            requires_full_reload: true,
+            changes,
+        }));
+    }
+
+    Ok(BoardFeedChangesLoadResult::Changes(BoardFeedChangesResponse {
+        base_revision: since_revision.to_string(),
+        target_revision,
+        next_cursor: current_feed.next_cursor.clone(),
+        server_time: current_feed.server_time.clone(),
+        requires_full_reload: false,
+        changes,
+    }))
+}
+
+fn apply_feed_metadata(feed: &mut BoardFeedResponse) -> anyhow::Result<()> {
+    let page_digest = board_feed_page_digest(feed.items.as_slice(), feed.next_cursor.as_deref())?;
+    let max_updated_at_ms = feed
+        .items
+        .iter()
+        .map(board_post_updated_at_ms)
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .max()
+        .unwrap_or_default();
+
+    feed.page_digest = Some(page_digest.clone());
+    feed.feed_revision = Some(format!("pulse-feed-v1-latest-{max_updated_at_ms}-{page_digest}"));
+    Ok(())
+}
+
+fn feed_revision_value(feed: &BoardFeedResponse) -> anyhow::Result<String> {
+    feed.feed_revision
+        .clone()
+        .with_context(|| "feed revision missing".to_string())
+}
+
+fn board_feed_page_digest(items: &[BoardPostResponse], next_cursor: Option<&str>) -> anyhow::Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pulse-feed-page-v1");
+    if let Some(next_cursor) = next_cursor {
+        hasher.update(next_cursor.as_bytes());
+    }
+
+    for post in items {
+        hasher.update(post.id.as_bytes());
+        hasher.update(b"|");
+        hasher.update(board_post_revision_value(post)?.as_bytes());
+        hasher.update(b"|");
+    }
+
+    Ok(hex_string(&hasher.finalize()))
+}
+
+fn board_post_revision_value(post: &BoardPostResponse) -> anyhow::Result<String> {
+    if let Some(revision) = post
+        .revision_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(revision.to_string());
+    }
+
+    let updated_at = post
+        .updated_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(post.created_at.as_str());
+    let updated_at_ms = parse_timestamp_ms(updated_at)?;
+
+    let mut clone = post.clone();
+    clone.revision_token = None;
+    let digest = Sha256::digest(serde_json::to_vec(&clone).context("encode board post fallback revision")?);
+    Ok(format!(
+        "post-v1-{updated_at_ms}-{}",
+        hex_string(digest.as_slice())
+    ))
+}
+
+fn materialize_post_response_for_storage(
+    response: &BoardPostResponse,
+    touch_updated_at: bool,
+) -> anyhow::Result<BoardPostResponse> {
+    let mut stored = response.clone();
+    let updated_at = if touch_updated_at {
+        timestamp_string(OffsetDateTime::now_utc())?
+    } else {
+        stored
+            .updated_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| stored.created_at.clone())
+    };
+
+    stored.updated_at = Some(updated_at.clone());
+    stored.revision_token = None;
+
+    let updated_at_ms = parse_timestamp_ms(updated_at.as_str())?;
+    let payload_bytes = serde_json::to_vec(&stored).context("encode board post revision payload")?;
+    let digest = Sha256::digest(payload_bytes);
+    stored.revision_token = Some(format!(
+        "post-v1-{updated_at_ms}-{}",
+        hex_string(digest.as_slice())
+    ));
+    Ok(stored)
+}
+
+fn board_post_updated_at_ms(post: &BoardPostResponse) -> anyhow::Result<u64> {
+    let updated_at = post
+        .updated_at
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(post.created_at.as_str());
+    parse_timestamp_ms(updated_at)
+}
+
+fn normalize_revision_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let trimmed = trimmed
+        .strip_prefix("W/")
+        .or_else(|| trimmed.strip_prefix("w/"))
+        .unwrap_or(trimmed)
+        .trim();
+    let trimmed = trimmed.trim_matches('"').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn normalized_revision_value_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        .and_then(normalize_revision_value)
+}
+
+fn parse_feed_revision_cutoff_ms(revision: &str) -> Option<u64> {
+    let normalized = normalize_revision_value(revision)?;
+    let mut segments = normalized.rsplitn(2, '-');
+    let _digest = segments.next()?;
+    let prefix = segments.next()?;
+    let cutoff_ms = prefix.rsplit('-').next()?;
+    cutoff_ms.parse::<u64>().ok()
+}
+
+fn feed_transport_headers(revision: &str, supports_changes_since_revision: bool) -> anyhow::Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "etag",
+        HeaderValue::from_str(revision).context("encode Pulse feed revision header")?,
+    );
+    headers.insert(
+        "x-kbeam-feed-changes",
+        HeaderValue::from_static(if supports_changes_since_revision { "true" } else { "false" }),
+    );
+    Ok(headers)
+}
+
 fn count_reports_for_post(
     partition: &BoardReportByPostActorPartition,
     rtx: &fjall::ReadTransaction,
@@ -1240,29 +1603,31 @@ fn ensure_post_exists(
     }
 }
 
-fn write_post_response(
+fn write_post_response_with_touch(
     state: &BoardApi,
     wtx: &mut fjall::WriteTransaction,
     response: &BoardPostResponse,
-) -> anyhow::Result<()> {
-    let json_bytes = serde_json::to_vec(response).context("serialize board post response")?;
+    touch_updated_at: bool,
+) -> anyhow::Result<BoardPostResponse> {
+    let stored_response = materialize_post_response_for_storage(response, touch_updated_at)?;
+    let json_bytes = serde_json::to_vec(&stored_response).context("serialize board post response")?;
     state
         .board_post_by_id_partition
-        .insert_wtx(wtx, response.id.as_str(), &json_bytes);
+        .insert_wtx(wtx, stored_response.id.as_str(), &json_bytes);
 
-    if response.reply_to_post_id.is_none() {
-        let post_uuid = Uuid::parse_str(response.id.trim()).context("board post id must be a UUID")?;
+    if stored_response.reply_to_post_id.is_none() {
+        let post_uuid = Uuid::parse_str(stored_response.id.trim()).context("board post id must be a UUID")?;
         state.board_post_by_created_at_partition.insert_wtx(
             wtx,
             &BoardPostByCreatedAtKey {
-                created_at_ms: U64::new(parse_timestamp_ms(&response.created_at)?),
+                created_at_ms: U64::new(parse_timestamp_ms(&stored_response.created_at)?),
                 post_uuid: *post_uuid.as_bytes(),
             },
             &json_bytes,
         );
     }
 
-    Ok(())
+    Ok(stored_response)
 }
 
 fn update_post_reply_count(
@@ -1276,7 +1641,8 @@ fn update_post_reply_count(
     drop(rtx);
 
     post.reply_count = post.reply_count.saturating_add(delta);
-    write_post_response(state, wtx, &post)
+    let _ = write_post_response_with_touch(state, wtx, &post, true)?;
+    Ok(())
 }
 
 fn update_post_reaction_count(
@@ -1290,7 +1656,8 @@ fn update_post_reaction_count(
     drop(rtx);
 
     post.reaction_count = new_count.max(0);
-    write_post_response(state, wtx, &post)
+    let _ = write_post_response_with_touch(state, wtx, &post, true)?;
+    Ok(())
 }
 
 fn validate_create_post_request(
@@ -1688,4 +2055,10 @@ fn display_url(url: &str) -> Cow<'_, str> {
         return Cow::Owned(stripped.to_string());
     }
     Cow::Borrowed(url)
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    let mut output = vec![0u8; bytes.len() * 2];
+    faster_hex::hex_encode(bytes, &mut output).expect("hex encode board digest");
+    String::from_utf8(output).expect("hex output is valid utf8")
 }

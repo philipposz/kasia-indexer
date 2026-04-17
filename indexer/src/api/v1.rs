@@ -60,6 +60,7 @@ pub mod self_stash;
         push::update_device,
         push::unregister_device,
         crate::api::board::get_board_feed,
+        crate::api::board::get_board_feed_changes,
         crate::api::board::get_board_profile_feed,
         crate::api::board::get_board_profile_connections,
         crate::api::board::get_board_post_detail,
@@ -73,7 +74,7 @@ pub mod self_stash;
         get_metrics,
     ),
     components(
-        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, gift::GiftChallengeResponse, gift::GiftClaimRequest, gift::GiftClaimResponse, gift::GiftDeviceCheckDebugQueryRequest, gift::GiftDeviceCheckDebugQueryResponse, gift::GiftDeviceCheckDebugUpdateRequest, gift::GiftDeviceCheckDebugUpdateResponse, gift::GiftErrorResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, crate::api::board::BoardFeedResponse, crate::api::board::BoardPostResponse, crate::api::board::BoardPostDetailResponse, crate::api::board::BoardCreatePostRequest, crate::api::board::BoardCreateReactionRequest, crate::api::board::BoardCreateFollowRequest, crate::api::board::BoardCreateReportRequest, crate::api::board::BoardAuthorResponse, crate::api::board::BoardAttachmentPayload, crate::api::board::BoardLinkPreviewResponse, crate::api::board::BoardReactionSummaryResponse, crate::api::board::BoardErrorResponse, crate::api::board::BoardProfileConnectionsResponse, crate::api::board::BoardFollowMutationResponse, crate::api::board::BoardReportMutationResponse, IndexerMetricsSnapshot)
+        schemas(handshakes::HandshakeResponse, contextual_messages::ContextualMessageResponse, payments::PaymentResponse, gift::GiftChallengeResponse, gift::GiftClaimRequest, gift::GiftClaimResponse, gift::GiftDeviceCheckDebugQueryRequest, gift::GiftDeviceCheckDebugQueryResponse, gift::GiftDeviceCheckDebugUpdateRequest, gift::GiftDeviceCheckDebugUpdateResponse, gift::GiftErrorResponse, push::PushChallengeResponse, push::PushErrorResponse, push::PushOkResponse, self_stash::SelfStashResponse, crate::api::board::BoardFeedResponse, crate::api::board::BoardFeedChangesResponse, crate::api::board::BoardFeedChangeResponse, crate::api::board::BoardPostResponse, crate::api::board::BoardPostDetailResponse, crate::api::board::BoardCreatePostRequest, crate::api::board::BoardCreateReactionRequest, crate::api::board::BoardCreateFollowRequest, crate::api::board::BoardCreateReportRequest, crate::api::board::BoardAuthorResponse, crate::api::board::BoardAttachmentPayload, crate::api::board::BoardLinkPreviewResponse, crate::api::board::BoardReactionSummaryResponse, crate::api::board::BoardErrorResponse, crate::api::board::BoardProfileConnectionsResponse, crate::api::board::BoardFollowMutationResponse, crate::api::board::BoardReportMutationResponse, IndexerMetricsSnapshot)
     ),
     tags(
         (name = "Kasia Indexer API", description = "Kasia Indexer API")

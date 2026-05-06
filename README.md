@@ -50,6 +50,7 @@ The default `docker-compose.yaml` is configured for an iOS-first push profile:
 - APNs as primary provider (`PUSH_PROVIDER=apns`)
 - FCM disabled by default (`PUSH_FCM_ENABLED=false`)
 - APNs `.p8` key mounted from host into container at `/app/secrets/apns/AuthKey.p8`
+- FCM service-account JSON mounted only when Android push is enabled
 
 ### 1) Prepare env file
 
@@ -84,7 +85,31 @@ chmod 600 secrets/apns/AuthKey.p8
 docker compose up -d --build
 ```
 
-### 4) Check health/logs
+### 4) Optional Android FCM push
+
+Keep APNs enabled exactly as before and enable FCM additively:
+
+```bash
+PUSH_FCM_ENABLED=true
+PUSH_FCM_PROJECT_ID=<firebase_project_id>
+PUSH_FCM_SERVICE_ACCOUNT_PATH=/app/secrets/fcm/service-account.json
+```
+
+Place the Firebase service-account JSON on the host without committing it:
+
+```bash
+mkdir -p secrets/fcm
+cp /path/to/firebase-service-account.json secrets/fcm/service-account.json
+chmod 600 secrets/fcm/service-account.json
+```
+
+Run the preflight check again before deploying:
+
+```bash
+./scripts/check-env.sh --env-file .env
+```
+
+### 5) Check health/logs
 
 ```bash
 docker compose ps
@@ -165,4 +190,9 @@ PUSH_APNS_KEY_PATH=/app/secrets/apns/AuthKey.p8
 # Optional APNs dispatch tuning
 PUSH_INLINE_PAYLOAD_LIMIT=3500
 PUSH_APNS_TIMEOUT_MS=15000
+
+# Optional Android FCM push; keep false until service-account JSON is mounted.
+PUSH_FCM_PROJECT_ID=
+PUSH_FCM_SERVICE_ACCOUNT_PATH=/app/secrets/fcm/service-account.json
+PUSH_FCM_TIMEOUT_MS=15000
 ```

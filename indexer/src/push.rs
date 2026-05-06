@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use utoipa::ToSchema;
@@ -43,6 +43,7 @@ pub struct PushService {
     registrations: Arc<RwLock<HashMap<String, DeviceRegistration>>>,
     challenges: Arc<RwLock<HashMap<String, ChallengeEntry>>>,
     apns_client: Option<Arc<ApnsClient>>,
+    fcm_client: Option<Arc<FcmClient>>,
     recent_dispatches: Arc<Mutex<HashMap<String, u64>>>,
     dispatch_dedupe_ttl_ms: u64,
     dispatch_counters: Arc<PushDispatchCounters>,
@@ -62,6 +63,9 @@ pub struct PushConfig {
     pub apns_key_path: Option<PathBuf>,
     pub apns_inline_payload_limit: usize,
     pub apns_timeout_ms: u64,
+    pub fcm_project_id: Option<String>,
+    pub fcm_service_account_path: Option<PathBuf>,
+    pub fcm_timeout_ms: u64,
 }
 
 impl PushConfig {
@@ -82,6 +86,10 @@ impl PushConfig {
             apns_key_path: read_env_string("PUSH_APNS_KEY_PATH").map(PathBuf::from),
             apns_inline_payload_limit: read_env_usize("PUSH_INLINE_PAYLOAD_LIMIT", 3500),
             apns_timeout_ms: read_env_u64("PUSH_APNS_TIMEOUT_MS", 15_000),
+            fcm_project_id: read_env_string("PUSH_FCM_PROJECT_ID"),
+            fcm_service_account_path: read_env_string("PUSH_FCM_SERVICE_ACCOUNT_PATH")
+                .map(PathBuf::from),
+            fcm_timeout_ms: read_env_u64("PUSH_FCM_TIMEOUT_MS", 15_000),
         }
     }
 }
@@ -331,12 +339,24 @@ impl PushService {
             )
             .ok()
             .map(Arc::new);
+        let fcm_client = if config.push_fcm_enabled {
+            FcmClient::from_config(&config)
+                .inspect_err(|error| {
+                    warn!(%error, "Failed to initialize FCM client, Android push dispatch disabled")
+                })
+                .ok()
+                .map(Arc::new)
+        } else {
+            None
+        };
 
         info!(
-            "Push service initialized provider={} ios_enabled={} fcm_enabled={} registrations={}",
+            "Push service initialized provider={} ios_enabled={} fcm_enabled={} apns_ready={} fcm_ready={} registrations={}",
             config.push_provider,
             config.push_ios_enabled,
             config.push_fcm_enabled,
+            apns_client.is_some(),
+            fcm_client.is_some(),
             registrations.len()
         );
 
@@ -347,6 +367,7 @@ impl PushService {
             registrations: Arc::new(RwLock::new(registrations)),
             challenges: Arc::new(RwLock::new(HashMap::new())),
             apns_client,
+            fcm_client,
             recent_dispatches: Arc::new(Mutex::new(HashMap::new())),
             dispatch_dedupe_ttl_ms: 15 * 60 * 1000,
             dispatch_counters: Arc::new(PushDispatchCounters::default()),
@@ -410,11 +431,13 @@ impl PushService {
     }
 
     async fn dispatch_event(&self, event: PushDispatchEvent) -> anyhow::Result<()> {
-        self.dispatch_counters.events.fetch_add(1, Ordering::Relaxed);
+        self.dispatch_counters
+            .events
+            .fetch_add(1, Ordering::Relaxed);
 
-        let Some(apns_client) = &self.apns_client else {
+        if self.apns_client.is_none() && self.fcm_client.is_none() {
             return Ok(());
-        };
+        }
 
         let Some(sender) = event.sender else {
             return Ok(());
@@ -425,10 +448,7 @@ impl PushService {
         };
         let receiver_address = self.address_payload_to_string(&event.receiver)?;
         let contextual_alias = if matches!(event.message_type, PushMessageType::Contextual) {
-            event
-                .payload
-                .as_deref()
-                .and_then(extract_contextual_alias)
+            event.payload.as_deref().and_then(extract_contextual_alias)
         } else {
             None
         };
@@ -495,28 +515,13 @@ impl PushService {
             }
         }
 
-        let targets = self
-            .matching_registrations(
-                event.message_type,
-                &sender_address,
-                receiver_address.as_deref(),
-                contextual_alias.as_deref(),
-            )
-            .await;
-        self.dispatch_counters
-            .targets
-            .fetch_add(targets.len() as u64, Ordering::Relaxed);
-
-        if targets.is_empty() {
-            return Ok(());
-        }
-
         let tx_id = faster_hex::hex_string(&event.tx_id);
         let payload_hex = event
             .payload
             .as_ref()
             .map(|payload| faster_hex::hex_string(payload))
             .filter(|payload| payload.len() <= self.config.apns_inline_payload_limit);
+        let message_type_tag = push_message_type_tag(event.message_type);
 
         let mut body = serde_json::Map::new();
         body.insert(
@@ -539,64 +544,173 @@ impl PushService {
         );
         body.insert("tx_id".to_string(), json!(tx_id));
         body.insert("sender".to_string(), json!(sender_address));
-        body.insert(
-            "type".to_string(),
-            json!(push_message_type_tag(event.message_type)),
-        );
+        body.insert("type".to_string(), json!(message_type_tag));
         body.insert("timestamp".to_string(), json!(event.timestamp));
         if let Some(amount) = event.amount {
             body.insert("amount".to_string(), json!(amount));
         }
-        if let Some(payload) = payload_hex {
+        if let Some(payload) = payload_hex.as_deref() {
             body.insert("payload".to_string(), json!(payload));
         }
         let payload = Value::Object(body);
 
+        let mut data = HashMap::new();
+        data.insert("tx_id".to_string(), tx_id.clone());
+        data.insert("sender".to_string(), sender_address.clone());
+        data.insert("type".to_string(), message_type_tag.to_string());
+        data.insert("timestamp".to_string(), event.timestamp.to_string());
+        if let Some(amount) = event.amount {
+            data.insert("amount".to_string(), amount.to_string());
+        }
+        if let Some(payload) = payload_hex {
+            data.insert("payload".to_string(), payload);
+        }
+
         let mut stale_tokens = Vec::new();
-        for registration in targets {
-            if self
-                .was_recently_dispatched(&registration.device_token, &tx_id, event.message_type)
-                .await
-            {
-                self.dispatch_counters.deduped.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    token = %registration.device_token,
-                    tx_id = %tx_id,
-                    "Skipping duplicate push dispatch"
-                );
-                continue;
-            }
+        if let Some(apns_client) = &self.apns_client {
+            let apns_targets = self
+                .matching_registrations(
+                    event.message_type,
+                    &sender_address,
+                    receiver_address.as_deref(),
+                    contextual_alias.as_deref(),
+                    "apns",
+                )
+                .await;
+            self.dispatch_counters
+                .targets
+                .fetch_add(apns_targets.len() as u64, Ordering::Relaxed);
 
-            self.dispatch_counters.attempts.fetch_add(1, Ordering::Relaxed);
-
-            match apns_client
-                .send_notification(&registration.device_token, &payload, event.message_type)
-                .await
-            {
-                Ok(ApnsSendOutcome::Sent) => {
-                    self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
-                    self
-                        .mark_recent_dispatch(&registration.device_token, &tx_id, event.message_type)
-                        .await;
+            for registration in apns_targets {
+                if self
+                    .was_recently_dispatched(&registration.device_token, &tx_id, event.message_type)
+                    .await
+                {
+                    self.dispatch_counters
+                        .deduped
+                        .fetch_add(1, Ordering::Relaxed);
                     debug!(
                         token = %registration.device_token,
                         tx_id = %tx_id,
-                        "Push notification sent"
+                        "Skipping duplicate push dispatch"
                     );
+                    continue;
                 }
-                Ok(ApnsSendOutcome::InvalidToken) => {
-                    self.dispatch_counters.invalid.fetch_add(1, Ordering::Relaxed);
-                    warn!(token = %registration.device_token, "APNs token is invalid, pruning registration");
-                    stale_tokens.push(registration.device_token);
+
+                self.dispatch_counters
+                    .attempts
+                    .fetch_add(1, Ordering::Relaxed);
+
+                match apns_client
+                    .send_notification(&registration.device_token, &payload, event.message_type)
+                    .await
+                {
+                    Ok(ApnsSendOutcome::Sent) => {
+                        self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
+                        self.mark_recent_dispatch(
+                            &registration.device_token,
+                            &tx_id,
+                            event.message_type,
+                        )
+                        .await;
+                        debug!(
+                            token = %registration.device_token,
+                            tx_id = %tx_id,
+                            "APNs notification sent"
+                        );
+                    }
+                    Ok(ApnsSendOutcome::InvalidToken) => {
+                        self.dispatch_counters
+                            .invalid
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(token = %registration.device_token, "APNs token is invalid, pruning registration");
+                        stale_tokens.push(registration.device_token);
+                    }
+                    Err(error) => {
+                        self.dispatch_counters
+                            .failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            %error,
+                            token = %registration.device_token,
+                            tx_id = %tx_id,
+                            "APNs delivery failed"
+                        );
+                    }
                 }
-                Err(error) => {
-                    self.dispatch_counters.failed.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        %error,
+            }
+        }
+
+        if let Some(fcm_client) = &self.fcm_client {
+            let fcm_targets = self
+                .matching_registrations(
+                    event.message_type,
+                    &sender_address,
+                    receiver_address.as_deref(),
+                    contextual_alias.as_deref(),
+                    "fcm",
+                )
+                .await;
+            self.dispatch_counters
+                .targets
+                .fetch_add(fcm_targets.len() as u64, Ordering::Relaxed);
+
+            for registration in fcm_targets {
+                if self
+                    .was_recently_dispatched(&registration.device_token, &tx_id, event.message_type)
+                    .await
+                {
+                    self.dispatch_counters
+                        .deduped
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
                         token = %registration.device_token,
                         tx_id = %tx_id,
-                        "APNs delivery failed"
+                        "Skipping duplicate push dispatch"
                     );
+                    continue;
+                }
+
+                self.dispatch_counters
+                    .attempts
+                    .fetch_add(1, Ordering::Relaxed);
+
+                match fcm_client
+                    .send_data_message(&registration.device_token, &data)
+                    .await
+                {
+                    Ok(FcmSendOutcome::Sent) => {
+                        self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
+                        self.mark_recent_dispatch(
+                            &registration.device_token,
+                            &tx_id,
+                            event.message_type,
+                        )
+                        .await;
+                        debug!(
+                            token = %registration.device_token,
+                            tx_id = %tx_id,
+                            "FCM notification sent"
+                        );
+                    }
+                    Ok(FcmSendOutcome::InvalidToken) => {
+                        self.dispatch_counters
+                            .invalid
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(token = %registration.device_token, "FCM token is invalid, pruning registration");
+                        stale_tokens.push(registration.device_token);
+                    }
+                    Err(error) => {
+                        self.dispatch_counters
+                            .failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            %error,
+                            token = %registration.device_token,
+                            tx_id = %tx_id,
+                            "FCM delivery failed"
+                        );
+                    }
                 }
             }
         }
@@ -636,7 +750,11 @@ impl PushService {
         recent.insert(key, now);
     }
 
-    fn dispatch_dedupe_key(device_token: &str, tx_id: &str, _message_type: PushMessageType) -> String {
+    fn dispatch_dedupe_key(
+        device_token: &str,
+        tx_id: &str,
+        _message_type: PushMessageType,
+    ) -> String {
         format!("{device_token}:{tx_id}")
     }
 
@@ -646,6 +764,7 @@ impl PushService {
         _sender_address: &str,
         receiver_address: Option<&str>,
         contextual_alias: Option<&str>,
+        token_type: &str,
     ) -> Vec<DeviceRegistration> {
         let registrations = self.registrations.read().await;
         let configured_bundle_id = self
@@ -656,8 +775,11 @@ impl PushService {
 
         registrations
             .values()
-            .filter(|registration| registration.token_type == "apns")
+            .filter(|registration| registration.token_type == token_type)
             .filter(|registration| {
+                if token_type != "apns" {
+                    return true;
+                }
                 if let Some(required_bundle_id) = configured_bundle_id.as_deref() {
                     registration.app_bundle_id.as_deref() == Some(required_bundle_id)
                 } else {
@@ -736,8 +858,8 @@ impl PushService {
 
     pub async fn register(&self, request: PushRegistrationRequest) -> Result<(), PushApiError> {
         let now = now_ms();
-        let token = normalize_device_token(&request.device_token)?;
         let token_type = normalize_token_type(&request.token_type);
+        let token = normalize_device_token(&request.device_token, &token_type)?;
         self.validate_token_and_type(&token, &token_type)?;
 
         let auth = self.validate_auth(request.auth.as_ref()).await?;
@@ -790,8 +912,8 @@ impl PushService {
 
     pub async fn update(&self, request: PushUpdateRequest) -> Result<(), PushApiError> {
         let now = now_ms();
-        let token = normalize_device_token(&request.device_token)?;
         let token_type = normalize_token_type(&request.token_type);
+        let token = normalize_device_token(&request.device_token, &token_type)?;
         self.validate_token_and_type(&token, &token_type)?;
 
         let auth = self.validate_auth(request.auth.as_ref()).await?;
@@ -831,8 +953,8 @@ impl PushService {
     }
 
     pub async fn unregister(&self, request: PushUnregisterRequest) -> Result<(), PushApiError> {
-        let token = normalize_device_token(&request.device_token)?;
         let token_type = normalize_token_type(&request.token_type);
+        let token = normalize_device_token(&request.device_token, &token_type)?;
         self.validate_token_and_type(&token, &token_type)?;
 
         let auth = self.validate_auth(request.auth.as_ref()).await?;
@@ -864,10 +986,8 @@ impl PushService {
         let normalized_wallet_address = normalize_address(wallet_address)
             .ok_or_else(|| PushApiError::bad_request("invalid wallet address"))?;
         let now = now_ms();
-        let active_window_ms = read_env_u64(
-            "PUSH_STATUS_ACTIVE_WINDOW_MS",
-            45 * 24 * 60 * 60 * 1000,
-        );
+        let active_window_ms =
+            read_env_u64("PUSH_STATUS_ACTIVE_WINDOW_MS", 45 * 24 * 60 * 60 * 1000);
         let configured_bundle_id = self
             .config
             .apns_bundle_id
@@ -913,32 +1033,18 @@ impl PushService {
     }
 
     pub async fn dispatch_pulse_reply(&self, event: PulseReplyPushEvent) -> anyhow::Result<()> {
-        self.dispatch_counters.events.fetch_add(1, Ordering::Relaxed);
+        self.dispatch_counters
+            .events
+            .fetch_add(1, Ordering::Relaxed);
 
-        let Some(apns_client) = &self.apns_client else {
+        if self.apns_client.is_none() && self.fcm_client.is_none() {
             return Ok(());
-        };
+        }
 
         let parent_author_address = normalize_address(&event.parent_author_address)
             .ok_or_else(|| anyhow::anyhow!("invalid pulse reply target address"))?;
         let actor_address = normalize_address(&event.actor_address)
             .ok_or_else(|| anyhow::anyhow!("invalid pulse reply actor address"))?;
-
-        let targets = self
-            .matching_registrations(
-                PushMessageType::PulseReply,
-                &actor_address,
-                Some(parent_author_address.as_str()),
-                None,
-            )
-            .await;
-        self.dispatch_counters
-            .targets
-            .fetch_add(targets.len() as u64, Ordering::Relaxed);
-
-        if targets.is_empty() {
-            return Ok(());
-        }
 
         let actor_display_name = event.actor_display_name.trim();
         let actor_display_name = if actor_display_name.is_empty() {
@@ -976,54 +1082,162 @@ impl PushService {
             "timestamp": event.timestamp,
         });
 
-        for registration in targets {
-            if self
-                .was_recently_dispatched(
-                    &registration.device_token,
-                    event.reply_id.as_str(),
-                    PushMessageType::PulseReply,
-                )
-                .await
-            {
-                self.dispatch_counters.deduped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+        let mut data = HashMap::new();
+        data.insert("tx_id".to_string(), event.reply_id.clone());
+        data.insert("type".to_string(), "pulse_reply".to_string());
+        data.insert("sender".to_string(), actor_address.clone());
+        data.insert("post_id".to_string(), event.post_id.clone());
+        data.insert("actor_display_name".to_string(), actor_display_name.clone());
+        data.insert("body".to_string(), fallback_body);
+        data.insert("timestamp".to_string(), event.timestamp.to_string());
+        if let Some(actor_avatar_url) = actor_avatar_url {
+            data.insert("actor_avatar_url".to_string(), actor_avatar_url.to_string());
+        }
+        if let Some(preview_text) = preview_text {
+            data.insert("preview_text".to_string(), preview_text);
+        }
 
-            self.dispatch_counters.attempts.fetch_add(1, Ordering::Relaxed);
-            match apns_client
-                .send_notification(
-                    &registration.device_token,
-                    &payload,
+        let mut stale_tokens = Vec::new();
+        if let Some(apns_client) = &self.apns_client {
+            let apns_targets = self
+                .matching_registrations(
                     PushMessageType::PulseReply,
+                    &actor_address,
+                    Some(parent_author_address.as_str()),
+                    None,
+                    "apns",
                 )
-                .await
-            {
-                Ok(ApnsSendOutcome::Sent) => {
-                    self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
-                    self
-                        .mark_recent_dispatch(
+                .await;
+            self.dispatch_counters
+                .targets
+                .fetch_add(apns_targets.len() as u64, Ordering::Relaxed);
+
+            for registration in apns_targets {
+                if self
+                    .was_recently_dispatched(
+                        &registration.device_token,
+                        event.reply_id.as_str(),
+                        PushMessageType::PulseReply,
+                    )
+                    .await
+                {
+                    self.dispatch_counters
+                        .deduped
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                self.dispatch_counters
+                    .attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                match apns_client
+                    .send_notification(
+                        &registration.device_token,
+                        &payload,
+                        PushMessageType::PulseReply,
+                    )
+                    .await
+                {
+                    Ok(ApnsSendOutcome::Sent) => {
+                        self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
+                        self.mark_recent_dispatch(
                             &registration.device_token,
                             event.reply_id.as_str(),
                             PushMessageType::PulseReply,
                         )
                         .await;
-                }
-                Ok(ApnsSendOutcome::InvalidToken) => {
-                    self.dispatch_counters.invalid.fetch_add(1, Ordering::Relaxed);
-                    self.remove_stale_registrations(vec![registration.device_token.clone()])
-                        .await?;
-                }
-                Err(error) => {
-                    self.dispatch_counters.failed.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        %error,
-                        token = %registration.device_token,
-                        post_id = %event.post_id,
-                        reply_id = %event.reply_id,
-                        "APNs delivery failed for pulse reply"
-                    );
+                    }
+                    Ok(ApnsSendOutcome::InvalidToken) => {
+                        self.dispatch_counters
+                            .invalid
+                            .fetch_add(1, Ordering::Relaxed);
+                        stale_tokens.push(registration.device_token);
+                    }
+                    Err(error) => {
+                        self.dispatch_counters
+                            .failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            %error,
+                            token = %registration.device_token,
+                            post_id = %event.post_id,
+                            reply_id = %event.reply_id,
+                            "APNs delivery failed for pulse reply"
+                        );
+                    }
                 }
             }
+        }
+
+        if let Some(fcm_client) = &self.fcm_client {
+            let fcm_targets = self
+                .matching_registrations(
+                    PushMessageType::PulseReply,
+                    &actor_address,
+                    Some(parent_author_address.as_str()),
+                    None,
+                    "fcm",
+                )
+                .await;
+            self.dispatch_counters
+                .targets
+                .fetch_add(fcm_targets.len() as u64, Ordering::Relaxed);
+
+            for registration in fcm_targets {
+                if self
+                    .was_recently_dispatched(
+                        &registration.device_token,
+                        event.reply_id.as_str(),
+                        PushMessageType::PulseReply,
+                    )
+                    .await
+                {
+                    self.dispatch_counters
+                        .deduped
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                self.dispatch_counters
+                    .attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                match fcm_client
+                    .send_data_message(&registration.device_token, &data)
+                    .await
+                {
+                    Ok(FcmSendOutcome::Sent) => {
+                        self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
+                        self.mark_recent_dispatch(
+                            &registration.device_token,
+                            event.reply_id.as_str(),
+                            PushMessageType::PulseReply,
+                        )
+                        .await;
+                    }
+                    Ok(FcmSendOutcome::InvalidToken) => {
+                        self.dispatch_counters
+                            .invalid
+                            .fetch_add(1, Ordering::Relaxed);
+                        stale_tokens.push(registration.device_token);
+                    }
+                    Err(error) => {
+                        self.dispatch_counters
+                            .failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            %error,
+                            token = %registration.device_token,
+                            post_id = %event.post_id,
+                            reply_id = %event.reply_id,
+                            "FCM delivery failed for pulse reply"
+                        );
+                    }
+                }
+            }
+        }
+
+        if !stale_tokens.is_empty() {
+            self.remove_stale_registrations(stale_tokens).await?;
         }
 
         Ok(())
@@ -1039,7 +1253,7 @@ impl PushService {
 
         if token_type == "fcm" {
             if !self.config.push_fcm_enabled {
-                return Err(PushApiError::bad_request("invalid device token length"));
+                return Err(PushApiError::bad_request("FCM push is disabled"));
             }
             return Ok(());
         }
@@ -1284,6 +1498,201 @@ impl ApnsClient {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FcmSendOutcome {
+    Sent,
+    InvalidToken,
+}
+
+#[derive(Clone)]
+struct FcmClient {
+    client: reqwest::Client,
+    project_id: String,
+    service_account: Arc<FcmServiceAccount>,
+    encoding_key: EncodingKey,
+    token_cache: Arc<Mutex<Option<FcmBearerToken>>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FcmServiceAccount {
+    project_id: Option<String>,
+    private_key_id: Option<String>,
+    private_key: String,
+    client_email: String,
+    token_uri: Option<String>,
+}
+
+#[derive(Clone)]
+struct FcmBearerToken {
+    token: String,
+    expires_at_secs: u64,
+}
+
+#[derive(Serialize)]
+struct FcmClaims<'a> {
+    iss: &'a str,
+    scope: &'a str,
+    aud: &'a str,
+    iat: usize,
+    exp: usize,
+}
+
+#[derive(Deserialize)]
+struct FcmTokenResponse {
+    access_token: String,
+    expires_in: Option<u64>,
+}
+
+impl FcmClient {
+    fn from_config(config: &PushConfig) -> anyhow::Result<Self> {
+        if !config.push_fcm_enabled {
+            anyhow::bail!("FCM push provider is disabled")
+        }
+
+        let service_account_path = config
+            .fcm_service_account_path
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("PUSH_FCM_SERVICE_ACCOUNT_PATH is not set"))?;
+        let service_account_bytes = std::fs::read(&service_account_path).with_context(|| {
+            format!(
+                "failed to read FCM service account file {}",
+                service_account_path.display()
+            )
+        })?;
+        let service_account: FcmServiceAccount = serde_json::from_slice(&service_account_bytes)
+            .context("failed to parse FCM service account JSON")?;
+        let project_id = config
+            .fcm_project_id
+            .clone()
+            .or_else(|| service_account.project_id.clone())
+            .ok_or_else(|| anyhow::anyhow!("PUSH_FCM_PROJECT_ID is not set"))?;
+        let encoding_key = EncodingKey::from_rsa_pem(service_account.private_key.as_bytes())
+            .context("failed to parse FCM service account private key")?;
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(config.fcm_timeout_ms))
+            .build()
+            .context("failed to build FCM HTTP client")?;
+
+        Ok(Self {
+            client,
+            project_id,
+            service_account: Arc::new(service_account),
+            encoding_key,
+            token_cache: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    async fn send_data_message(
+        &self,
+        device_token: &str,
+        data: &HashMap<String, String>,
+    ) -> anyhow::Result<FcmSendOutcome> {
+        let auth_token = self.auth_token().await?;
+        let url = format!(
+            "https://fcm.googleapis.com/v1/projects/{}/messages:send",
+            self.project_id
+        );
+        let payload = json!({
+            "message": {
+                "token": device_token,
+                "data": data,
+                "android": {
+                    "priority": "HIGH"
+                }
+            }
+        });
+
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(auth_token)
+            .json(&payload)
+            .send()
+            .await
+            .context("failed to send FCM notification")?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(FcmSendOutcome::Sent);
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        if status == HttpStatusCode::UNAUTHORIZED {
+            self.invalidate_auth_token().await;
+        }
+        if is_invalid_fcm_token_response(&body) {
+            return Ok(FcmSendOutcome::InvalidToken);
+        }
+
+        anyhow::bail!("FCM rejected notification: status={} body={body}", status)
+    }
+
+    async fn auth_token(&self) -> anyhow::Result<String> {
+        let now_secs = now_ms() / 1000;
+        {
+            let cached = self.token_cache.lock().await;
+            if let Some(cached) = cached.as_ref()
+                && cached.expires_at_secs > now_secs.saturating_add(60)
+            {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        let token_uri = self
+            .service_account
+            .token_uri
+            .as_deref()
+            .unwrap_or("https://oauth2.googleapis.com/token");
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = self.service_account.private_key_id.clone();
+        let claims = FcmClaims {
+            iss: &self.service_account.client_email,
+            scope: "https://www.googleapis.com/auth/firebase.messaging",
+            aud: token_uri,
+            iat: now_secs as usize,
+            exp: now_secs.saturating_add(3600) as usize,
+        };
+        let assertion = jsonwebtoken::encode(&header, &claims, &self.encoding_key)
+            .context("failed to sign FCM OAuth JWT")?;
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer")
+            .append_pair("assertion", &assertion)
+            .finish();
+
+        let response = self
+            .client
+            .post(token_uri)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await
+            .context("failed to request FCM OAuth token")?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!(
+                "FCM OAuth token request failed: status={} body={body}",
+                status
+            );
+        }
+
+        let token_response: FcmTokenResponse =
+            serde_json::from_str(&body).context("failed to parse FCM OAuth token response")?;
+        let expires_in = token_response.expires_in.unwrap_or(3600);
+        let mut cache = self.token_cache.lock().await;
+        *cache = Some(FcmBearerToken {
+            token: token_response.access_token.clone(),
+            expires_at_secs: now_secs.saturating_add(expires_in),
+        });
+        Ok(token_response.access_token)
+    }
+
+    async fn invalidate_auth_token(&self) {
+        let mut cache = self.token_cache.lock().await;
+        *cache = None;
+    }
+}
+
 fn extract_apns_reason(body: &str) -> Option<String> {
     serde_json::from_str::<ApnsErrorBody>(body)
         .ok()
@@ -1297,6 +1706,39 @@ fn is_invalid_token_response(status: HttpStatusCode, reason: &str) -> bool {
             | (HttpStatusCode::BAD_REQUEST, "DeviceTokenNotForTopic")
             | (HttpStatusCode::GONE, "Unregistered")
     )
+}
+
+fn is_invalid_fcm_token_response(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let error = value.get("error").unwrap_or(&value);
+    let status = error
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    if status == "NOT_FOUND" || status == "UNREGISTERED" {
+        return true;
+    }
+
+    if status != "INVALID_ARGUMENT" {
+        return false;
+    }
+
+    error
+        .get("details")
+        .and_then(Value::as_array)
+        .is_some_and(|details| {
+            details.iter().any(|detail| {
+                detail
+                    .get("@type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| {
+                        value == "type.googleapis.com/google.firebase.fcm.v1.FcmError"
+                    })
+            })
+        })
 }
 
 fn push_message_type_tag(message_type: PushMessageType) -> &'static str {
@@ -1389,8 +1831,8 @@ fn parse_contextual_alias_policy(alias: &str, allow_legacy_suffix: bool) -> Cont
 }
 
 fn parse_contextual_unknown_policy() -> ContextualUnknownPolicy {
-    let value = read_env_string("PUSH_CONTEXTUAL_UNKNOWN_POLICY")
-        .unwrap_or_else(|| "drop".to_string());
+    let value =
+        read_env_string("PUSH_CONTEXTUAL_UNKNOWN_POLICY").unwrap_or_else(|| "drop".to_string());
     match value.trim().to_lowercase().as_str() {
         "visible" => ContextualUnknownPolicy::Visible,
         _ => ContextualUnknownPolicy::Drop,
@@ -1398,8 +1840,8 @@ fn parse_contextual_unknown_policy() -> ContextualUnknownPolicy {
 }
 
 fn parse_contextual_alias_mode() -> &'static str {
-    let value = read_env_string("PUSH_CONTEXTUAL_ALIAS_MODE")
-        .unwrap_or_else(|| "strict".to_string());
+    let value =
+        read_env_string("PUSH_CONTEXTUAL_ALIAS_MODE").unwrap_or_else(|| "strict".to_string());
     match value.trim().to_lowercase().as_str() {
         "strict" => "strict",
         _ => "strict",
@@ -1422,8 +1864,7 @@ fn contextual_alias_policy_tag(policy: ContextualAliasPolicy) -> &'static str {
 }
 
 fn normalize_optional_address(value: Option<&str>) -> Option<String> {
-    value
-        .and_then(normalize_address)
+    value.and_then(normalize_address)
 }
 
 fn normalize_optional_bundle_id(value: Option<&str>) -> Option<String> {
@@ -1448,12 +1889,16 @@ fn normalize_address(value: &str) -> Option<String> {
     }
 }
 
-fn normalize_device_token(value: &str) -> Result<String, PushApiError> {
-    let token = value.trim().to_lowercase();
+fn normalize_device_token(value: &str, token_type: &str) -> Result<String, PushApiError> {
+    let token = value.trim();
     if token.is_empty() {
         return Err(PushApiError::bad_request("missing device token"));
     }
-    Ok(token)
+    if token_type == "apns" {
+        Ok(token.to_lowercase())
+    } else {
+        Ok(token.to_string())
+    }
 }
 
 fn normalize_token_type(value: &str) -> String {
@@ -1548,4 +1993,178 @@ async fn persist_registrations(path: &Path, values: Vec<DeviceRegistration>) -> 
 
     std::fs::write(path, encoded)
         .with_context(|| format!("failed to write push registrations to {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_apns_tokens_to_lowercase() {
+        let token = normalize_device_token(
+            " ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789 ",
+            "apns",
+        )
+        .unwrap();
+
+        assert_eq!(
+            token,
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+    }
+
+    #[test]
+    fn preserves_fcm_token_case() {
+        let token = normalize_device_token(" fcm:AbC_123-XyZ ", "fcm").unwrap();
+
+        assert_eq!(token, "fcm:AbC_123-XyZ");
+    }
+
+    #[test]
+    fn detects_invalid_fcm_registration_token_errors() {
+        let body = r#"{
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+                        "errorCode": "INVALID_ARGUMENT"
+                    }
+                ]
+            }
+        }"#;
+
+        assert!(is_invalid_fcm_token_response(body));
+    }
+
+    #[test]
+    fn keeps_fcm_payload_errors_from_pruning_tokens() {
+        let body = r#"{
+            "error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.BadRequest",
+                        "fieldViolations": []
+                    }
+                ]
+            }
+        }"#;
+
+        assert!(!is_invalid_fcm_token_response(body));
+    }
+
+    #[test]
+    fn matching_registrations_separates_apns_bundle_and_fcm_tokens() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let mut registrations = HashMap::new();
+            registrations.insert(
+                "apns-allowed".to_string(),
+                test_registration(
+                    "apns-allowed",
+                    "apns",
+                    Some("com.kbeam.app"),
+                    "kaspa:qreceiver",
+                ),
+            );
+            registrations.insert(
+                "apns-other-bundle".to_string(),
+                test_registration(
+                    "apns-other-bundle",
+                    "apns",
+                    Some("com.other.app"),
+                    "kaspa:qreceiver",
+                ),
+            );
+            registrations.insert(
+                "fcm-token".to_string(),
+                test_registration("fcm-token", "fcm", None, "kaspa:qreceiver"),
+            );
+
+            let service = test_service(registrations);
+            let apns_targets = service
+                .matching_registrations(
+                    PushMessageType::Payment,
+                    "kaspa:qsender",
+                    Some("kaspa:qreceiver"),
+                    None,
+                    "apns",
+                )
+                .await;
+            let fcm_targets = service
+                .matching_registrations(
+                    PushMessageType::Payment,
+                    "kaspa:qsender",
+                    Some("kaspa:qreceiver"),
+                    None,
+                    "fcm",
+                )
+                .await;
+
+            assert_eq!(apns_targets.len(), 1);
+            assert_eq!(apns_targets[0].device_token, "apns-allowed");
+            assert_eq!(fcm_targets.len(), 1);
+            assert_eq!(fcm_targets[0].device_token, "fcm-token");
+        });
+    }
+
+    fn test_service(registrations: HashMap<String, DeviceRegistration>) -> PushService {
+        PushService {
+            config: PushConfig {
+                push_provider: "apns".to_string(),
+                push_ios_enabled: true,
+                push_fcm_enabled: true,
+                challenge_ttl_ms: 120_000,
+                challenge_skew_ms: 15_000,
+                apns_environment: "auto".to_string(),
+                apns_team_id: None,
+                apns_key_id: None,
+                apns_bundle_id: Some("com.kbeam.app".to_string()),
+                apns_key_path: None,
+                apns_inline_payload_limit: 3500,
+                apns_timeout_ms: 15_000,
+                fcm_project_id: Some("kbeam-test".to_string()),
+                fcm_service_account_path: None,
+                fcm_timeout_ms: 15_000,
+            },
+            network: RpcNetworkType::Mainnet,
+            registrations_path: PathBuf::from("/tmp/kbeam-test-push-registrations.json"),
+            registrations: Arc::new(RwLock::new(registrations)),
+            challenges: Arc::new(RwLock::new(HashMap::new())),
+            apns_client: None,
+            fcm_client: None,
+            recent_dispatches: Arc::new(Mutex::new(HashMap::new())),
+            dispatch_dedupe_ttl_ms: 15 * 60 * 1000,
+            dispatch_counters: Arc::new(PushDispatchCounters::default()),
+        }
+    }
+
+    fn test_registration(
+        token: &str,
+        token_type: &str,
+        app_bundle_id: Option<&str>,
+        wallet_address: &str,
+    ) -> DeviceRegistration {
+        DeviceRegistration {
+            device_token: token.to_string(),
+            token_type: token_type.to_string(),
+            platform: token_type.to_string(),
+            app_bundle_id: app_bundle_id.map(str::to_string),
+            watched_addresses: HashSet::new(),
+            watch_pulse_reply_addresses: HashSet::new(),
+            primary_address: Some(wallet_address.to_string()),
+            aliases: Vec::new(),
+            wallet_pubkey: "00".repeat(32),
+            wallet_address: wallet_address.to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
 }

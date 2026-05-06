@@ -176,6 +176,13 @@ if key_exists "PUSH_APNS_ENVIRONMENT"; then
   fi
 fi
 
+push_fcm_enabled_value="$(get_env_value "PUSH_FCM_ENABLED")"
+push_fcm_enabled_value="${push_fcm_enabled_value:-false}"
+if is_true "${push_fcm_enabled_value}"; then
+  require_non_empty "PUSH_FCM_PROJECT_ID"
+  require_non_empty "PUSH_FCM_SERVICE_ACCOUNT_PATH"
+fi
+
 if [[ "${SKIP_FILE_CHECKS}" != "true" ]]; then
   if key_exists "PUSH_APNS_KEY_PATH"; then
     apns_key_path="$(get_env_value "PUSH_APNS_KEY_PATH")"
@@ -183,6 +190,16 @@ if [[ "${SKIP_FILE_CHECKS}" != "true" ]]; then
       host_apns_path="$(map_container_path_to_host "${apns_key_path}")"
       if [[ ! -f "${host_apns_path}" ]]; then
         fail "APNs key file not found: ${host_apns_path} (from PUSH_APNS_KEY_PATH=${apns_key_path})"
+      fi
+    fi
+  fi
+
+  if is_true "${push_fcm_enabled_value}" && key_exists "PUSH_FCM_SERVICE_ACCOUNT_PATH"; then
+    fcm_service_account_path="$(get_env_value "PUSH_FCM_SERVICE_ACCOUNT_PATH")"
+    if [[ -n "${fcm_service_account_path}" ]]; then
+      host_fcm_path="$(map_container_path_to_host "${fcm_service_account_path}")"
+      if [[ ! -f "${host_fcm_path}" ]]; then
+        fail "FCM service account file not found: ${host_fcm_path} (from PUSH_FCM_SERVICE_ACCOUNT_PATH=${fcm_service_account_path})"
       fi
     fi
   fi

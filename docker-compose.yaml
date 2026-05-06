@@ -23,6 +23,9 @@ services:
       PUSH_APNS_KEY_PATH: ${PUSH_APNS_KEY_PATH:-/app/secrets/apns/AuthKey.p8}
       PUSH_INLINE_PAYLOAD_LIMIT: ${PUSH_INLINE_PAYLOAD_LIMIT:-3500}
       PUSH_APNS_TIMEOUT_MS: ${PUSH_APNS_TIMEOUT_MS:-15000}
+      PUSH_FCM_PROJECT_ID: ${PUSH_FCM_PROJECT_ID:-}
+      PUSH_FCM_SERVICE_ACCOUNT_PATH: ${PUSH_FCM_SERVICE_ACCOUNT_PATH:-/app/secrets/fcm/service-account.json}
+      PUSH_FCM_TIMEOUT_MS: ${PUSH_FCM_TIMEOUT_MS:-15000}
 
       GIFT_ENABLED: ${GIFT_ENABLED:-true}
       GIFT_AMOUNT_SOMPI: ${GIFT_AMOUNT_SOMPI:-10000000}
@@ -51,6 +54,7 @@ services:
     volumes:
       - indexer-data:/data
       - ./secrets/apns:/app/secrets/apns:ro
+      - ./secrets/fcm:/app/secrets/fcm:ro
       - ./secrets/devicecheck:/app/secrets/devicecheck:ro
       - ./secrets/ssh:/app/secrets/ssh:ro
       - ./secrets/gift:/app/secrets/gift:ro

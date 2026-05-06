@@ -998,8 +998,10 @@ impl PushService {
         let registrations = self.registrations.read().await;
         let matching_registrations = registrations
             .values()
-            .filter(|registration| registration.token_type == "apns")
             .filter(|registration| {
+                if registration.token_type != "apns" {
+                    return true;
+                }
                 if let Some(required_bundle_id) = configured_bundle_id.as_deref() {
                     registration.app_bundle_id.as_deref() == Some(required_bundle_id)
                 } else {
@@ -2115,6 +2117,54 @@ mod tests {
         });
     }
 
+    #[test]
+    fn peer_status_counts_fcm_without_relaxing_apns_bundle_filter() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let mut registrations = HashMap::new();
+            registrations.insert(
+                "apns-allowed".to_string(),
+                test_registration(
+                    "apns-allowed",
+                    "apns",
+                    Some("com.kbeam.app"),
+                    "kaspa:qreceiver",
+                ),
+            );
+            registrations.insert(
+                "apns-other-bundle".to_string(),
+                test_registration(
+                    "apns-other-bundle",
+                    "apns",
+                    Some("com.other.app"),
+                    "kaspa:qreceiver",
+                ),
+            );
+            registrations.insert(
+                "fcm-token".to_string(),
+                test_registration(
+                    "fcm-token",
+                    "fcm",
+                    Some("com.kbeam.android"),
+                    "kaspa:qreceiver",
+                ),
+            );
+
+            let service = test_service(registrations);
+            let status = service
+                .peer_status_for_wallet_address("kaspa:qreceiver")
+                .await
+                .unwrap();
+
+            assert!(status.registered);
+            assert_eq!(status.device_count, 2);
+        });
+    }
+
     fn test_service(registrations: HashMap<String, DeviceRegistration>) -> PushService {
         PushService {
             config: PushConfig {
@@ -2164,7 +2214,7 @@ mod tests {
             wallet_pubkey: "00".repeat(32),
             wallet_address: wallet_address.to_string(),
             created_at_ms: 1,
-            updated_at_ms: 1,
+            updated_at_ms: now_ms(),
         }
     }
 }

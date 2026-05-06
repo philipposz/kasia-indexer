@@ -14,6 +14,7 @@ Add Android push delivery to the existing KBeam/Kasia indexer without changing t
 - Normal message and Pulse reply dispatch now collect APNs and FCM targets separately.
 - FCM dispatch uses Firebase HTTP v1 data-only messages and OAuth via a mounted service-account JSON.
 - FCM invalid-token pruning is intentionally conservative: payload validation errors are not treated as stale registration tokens.
+- The peer push status endpoint now includes FCM registrations while preserving the existing APNs bundle-id filter for APNs registrations.
 
 ## Required Android Server Config
 
@@ -36,6 +37,15 @@ cargo test -p indexer push::tests
 ```
 
 The env check validates FCM only when `PUSH_FCM_ENABLED=true`.
+
+## Status Lookup
+
+`GET /v1/push/status/by-wallet-address?wallet_address=<kaspa_address>` reports active registrations for the wallet address across:
+
+- APNs registrations matching the configured KBeam APNs bundle id.
+- FCM registrations for Android.
+
+This keeps iOS/APNs behavior scoped to the known bundle id while allowing Android to verify that an FCM registration is active.
 
 ## Rollback
 

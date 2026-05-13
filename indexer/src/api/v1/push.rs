@@ -5,7 +5,8 @@ use axum::{Json, Router};
 
 pub use crate::push::{
     PushChallengeResponse, PushErrorResponse, PushOkResponse, PushRegistrationRequest,
-    PushPeerStatusQuery, PushPeerStatusResponse, PushUnregisterRequest, PushUpdateRequest,
+    PushPeerStatusQuery, PushPeerStatusResponse, PushPresenceRequest, PushUnregisterRequest,
+    PushUpdateRequest,
 };
 
 #[derive(Clone)]
@@ -22,6 +23,7 @@ impl PushApi {
         Router::new()
             .route("/challenge", post(create_challenge))
             .route("/register", post(register_device))
+            .route("/presence", post(send_presence))
             .route("/update", put(update_device))
             .route("/unregister", delete(unregister_device))
             .route("/status/by-wallet-address", get(peer_status_by_wallet_address))
@@ -60,6 +62,30 @@ pub async fn register_device(
     state
         .service
         .register(request)
+        .await
+        .map_err(PushApiError::into_response)?;
+
+    Ok(Json(PushOkResponse { ok: true }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/push/presence",
+    request_body = PushPresenceRequest,
+    responses(
+        (status = 200, description = "Send an ephemeral presence event", body = PushOkResponse),
+        (status = 400, description = "Bad request", body = PushErrorResponse),
+        (status = 401, description = "Unauthorized", body = PushErrorResponse),
+        (status = 500, description = "Internal server error", body = PushErrorResponse)
+    )
+)]
+pub async fn send_presence(
+    State(state): State<PushApi>,
+    Json(request): Json<PushPresenceRequest>,
+) -> Result<Json<PushOkResponse>, (axum::http::StatusCode, Json<PushErrorResponse>)> {
+    state
+        .service
+        .dispatch_presence(request)
         .await
         .map_err(PushApiError::into_response)?;
 

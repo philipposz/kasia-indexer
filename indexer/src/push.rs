@@ -298,6 +298,16 @@ pub struct PushUnregisterRequest {
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
+pub struct PushPresenceRequest {
+    pub sender_address: String,
+    pub recipient_address: String,
+    pub event_type: String,
+    pub timestamp_ms: u64,
+    pub auth: Option<PushAuthRequest>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub struct PushAuthRequest {
     pub wallet_pubkey: String,
     pub wallet_address: String,
@@ -814,6 +824,39 @@ impl PushService {
             .collect()
     }
 
+    async fn registrations_for_wallet(
+        &self,
+        wallet_address: &str,
+        token_type: &str,
+    ) -> Vec<DeviceRegistration> {
+        let registrations = self.registrations.read().await;
+        let configured_bundle_id = self
+            .config
+            .apns_bundle_id
+            .as_deref()
+            .and_then(normalize_bundle_id);
+
+        registrations
+            .values()
+            .filter(|registration| registration.token_type == token_type)
+            .filter(|registration| {
+                if token_type != "apns" {
+                    return true;
+                }
+                if let Some(required_bundle_id) = configured_bundle_id.as_deref() {
+                    registration.app_bundle_id.as_deref() == Some(required_bundle_id)
+                } else {
+                    true
+                }
+            })
+            .filter(|registration| {
+                registration.wallet_address == wallet_address
+                    || registration.primary_address.as_deref() == Some(wallet_address)
+            })
+            .cloned()
+            .collect()
+    }
+
     fn address_payload_to_string(
         &self,
         payload: &indexer_db::AddressPayload,
@@ -854,6 +897,157 @@ impl PushService {
         );
 
         challenge
+    }
+
+    pub async fn dispatch_presence(
+        &self,
+        request: PushPresenceRequest,
+    ) -> Result<(), PushApiError> {
+        self.dispatch_counters
+            .events
+            .fetch_add(1, Ordering::Relaxed);
+
+        let sender_address = normalize_address(request.sender_address.as_str())
+            .ok_or_else(|| PushApiError::bad_request("invalid sender address"))?;
+        let recipient_address = normalize_address(request.recipient_address.as_str())
+            .ok_or_else(|| PushApiError::bad_request("invalid recipient address"))?;
+        if sender_address == recipient_address {
+            return Err(PushApiError::bad_request(
+                "sender and recipient must be different",
+            ));
+        }
+
+        let event_type = request.event_type.trim().to_lowercase();
+        if !matches!(
+            event_type.as_str(),
+            "presence_typing_start" | "presence_typing_stop" | "presence_activity"
+        ) {
+            return Err(PushApiError::bad_request("unsupported presence event type"));
+        }
+
+        let auth = self.validate_auth(request.auth.as_ref()).await?;
+        if auth.wallet_address != sender_address {
+            return Err(PushApiError::unauthorized(
+                "presence sender does not match authenticated wallet",
+            ));
+        }
+
+        if self.apns_client.is_none() && self.fcm_client.is_none() {
+            return Ok(());
+        }
+
+        let payload = json!({
+            "aps": {
+                "content-available": 1
+            },
+            "type": event_type,
+            "sender": sender_address,
+            "timestamp": request.timestamp_ms,
+        });
+
+        let mut data = HashMap::new();
+        data.insert("type".to_string(), event_type.clone());
+        data.insert("sender".to_string(), sender_address.clone());
+        data.insert("timestamp".to_string(), request.timestamp_ms.to_string());
+
+        let mut stale_tokens = Vec::new();
+        if let Some(apns_client) = &self.apns_client {
+            let apns_targets = self
+                .registrations_for_wallet(recipient_address.as_str(), "apns")
+                .await;
+            self.dispatch_counters
+                .targets
+                .fetch_add(apns_targets.len() as u64, Ordering::Relaxed);
+
+            for registration in apns_targets {
+                self.dispatch_counters
+                    .attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                match apns_client
+                    .send_notification(
+                        &registration.device_token,
+                        &payload,
+                        PushMessageType::Contextual,
+                    )
+                    .await
+                {
+                    Ok(ApnsSendOutcome::Sent) => {
+                        self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(ApnsSendOutcome::InvalidToken) => {
+                        self.dispatch_counters
+                            .invalid
+                            .fetch_add(1, Ordering::Relaxed);
+                        stale_tokens.push(registration.device_token);
+                    }
+                    Err(error) => {
+                        self.dispatch_counters
+                            .failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            %error,
+                            token = %registration.device_token,
+                            recipient = %recipient_address,
+                            presence_type = %event_type,
+                            "APNs presence delivery failed"
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(fcm_client) = &self.fcm_client {
+            let fcm_targets = self
+                .registrations_for_wallet(recipient_address.as_str(), "fcm")
+                .await;
+            self.dispatch_counters
+                .targets
+                .fetch_add(fcm_targets.len() as u64, Ordering::Relaxed);
+
+            for registration in fcm_targets {
+                self.dispatch_counters
+                    .attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                match fcm_client
+                    .send_data_message(&registration.device_token, &data)
+                    .await
+                {
+                    Ok(FcmSendOutcome::Sent) => {
+                        self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(FcmSendOutcome::InvalidToken) => {
+                        self.dispatch_counters
+                            .invalid
+                            .fetch_add(1, Ordering::Relaxed);
+                        stale_tokens.push(registration.device_token);
+                    }
+                    Err(error) => {
+                        self.dispatch_counters
+                            .failed
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            %error,
+                            token = %registration.device_token,
+                            recipient = %recipient_address,
+                            presence_type = %event_type,
+                            "FCM presence delivery failed"
+                        );
+                    }
+                }
+            }
+        }
+
+        if !stale_tokens.is_empty() {
+            self.remove_stale_registrations(stale_tokens)
+                .await
+                .map_err(|error| {
+                    PushApiError::internal(format!(
+                        "failed to prune stale push registrations: {error}"
+                    ))
+                })?;
+        }
+
+        Ok(())
     }
 
     pub async fn register(&self, request: PushRegistrationRequest) -> Result<(), PushApiError> {

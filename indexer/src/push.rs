@@ -1064,17 +1064,22 @@ impl PushService {
         let aliases = normalize_aliases(request.aliases.unwrap_or_default());
 
         let mut registrations = self.registrations.write().await;
-        let created_at_ms = registrations
-            .get(&token)
+        let existing_registration = registrations.get(&token).cloned();
+        let created_at_ms = existing_registration
+            .as_ref()
+            .filter(|value| value.wallet_pubkey == auth.wallet_pubkey)
             .map(|value| value.created_at_ms)
             .unwrap_or(now);
 
-        if let Some(existing) = registrations.get(&token)
+        if let Some(existing) = existing_registration.as_ref()
             && existing.wallet_pubkey != auth.wallet_pubkey
         {
-            return Err(PushApiError::unauthorized(
-                "device token is bound to another wallet",
-            ));
+            warn!(
+                token = %token,
+                previous_wallet = %existing.wallet_address,
+                new_wallet = %auth.wallet_address,
+                "Rebinding push device token to newly authenticated wallet"
+            );
         }
 
         registrations.insert(
@@ -2356,6 +2361,62 @@ mod tests {
 
             assert!(status.registered);
             assert_eq!(status.device_count, 2);
+        });
+    }
+
+    #[test]
+    fn register_rebinds_existing_device_token_to_new_wallet() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let token = "aa".repeat(32);
+            let mut registrations = HashMap::new();
+            registrations.insert(
+                token.clone(),
+                test_registration(
+                    token.as_str(),
+                    "apns",
+                    Some("com.kbeam.app"),
+                    "kaspa:qoldwallet",
+                ),
+            );
+
+            let service = test_service(registrations);
+            let challenge = service.create_challenge().await;
+            service
+                .register(PushRegistrationRequest {
+                    device_token: token.to_uppercase(),
+                    token_type: "apns".to_string(),
+                    platform: "ios".to_string(),
+                    app_bundle_id: Some("com.kbeam.app".to_string()),
+                    watched_addresses: vec!["kaspa:qnewwallet".to_string()],
+                    watch_pulse_reply_addresses: vec!["kaspa:qnewwallet".to_string()],
+                    primary_address: Some("kaspa:qnewwallet".to_string()),
+                    aliases: Some(vec!["new-alias__kbp1".to_string()]),
+                    auth: Some(PushAuthRequest {
+                        wallet_pubkey: "11".repeat(32),
+                        wallet_address: "kaspa:qnewwallet".to_string(),
+                        nonce: challenge.nonce,
+                        timestamp_ms: challenge.issued_at_ms,
+                        expires_at_ms: challenge.expires_at_ms,
+                        signature: "signature".to_string(),
+                    }),
+                })
+                .await
+                .unwrap();
+
+            let registrations = service.registrations.read().await;
+            let rebound = registrations.get(token.as_str()).unwrap();
+            assert_eq!(registrations.len(), 1);
+            assert_eq!(rebound.wallet_pubkey, "11".repeat(32));
+            assert_eq!(rebound.wallet_address, "kaspa:qnewwallet");
+            assert_eq!(rebound.primary_address.as_deref(), Some("kaspa:qnewwallet"));
+            assert!(rebound.watched_addresses.contains("kaspa:qnewwallet"));
+            assert_eq!(rebound.aliases, vec!["new-alias__kbp1".to_string()]);
+            assert_ne!(rebound.created_at_ms, 1);
         });
     }
 

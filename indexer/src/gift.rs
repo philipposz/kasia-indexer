@@ -21,6 +21,8 @@ use x509_parser::prelude::parse_x509_certificate;
 const APP_ATTEST_NONCE_OID: &str = "1.2.840.113635.100.8.2";
 const APP_ATTEST_AAGUID_PRODUCTION: [u8; 16] = *b"appattest\0\0\0\0\0\0\0";
 const APP_ATTEST_AAGUID_DEVELOPMENT: [u8; 16] = *b"appattestdevelop";
+const ANDROID_LOCAL_PROOF_SCHEMA: &str = "kbeam-android-local-proof-v1";
+const ANDROID_DEVICE_SCHEMA: &str = "kbeam-android-gift-device-v1";
 
 #[derive(Clone)]
 pub struct GiftService {
@@ -170,6 +172,11 @@ pub struct GiftChallengeResponse {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct GiftClaimRequest {
+    pub platform: Option<String>,
+    #[serde(alias = "proof_schema")]
+    pub proof_schema: Option<String>,
+    #[serde(alias = "proof_format")]
+    pub proof_format: Option<String>,
     #[serde(alias = "device_token")]
     pub device_token: String,
     #[serde(alias = "wallet_address")]
@@ -495,9 +502,38 @@ impl GiftService {
             return Err(GiftApiError::bad_request("missing key id"));
         }
 
+        let is_android_claim = request
+            .platform
+            .as_deref()
+            .map(|value| value.eq_ignore_ascii_case("android"))
+            .unwrap_or(false)
+            || request
+                .proof_schema
+                .as_deref()
+                .map(|value| value == ANDROID_LOCAL_PROOF_SCHEMA)
+                .unwrap_or(false)
+            || key_id.starts_with("android-local-proof-v1:");
+
         let skip_device_attestation = self.config.allow_simulator_claims && key_id.starts_with("simulator-");
 
-        if self.config.require_appattest && !skip_device_attestation {
+        let android_device_fingerprint = if is_android_claim {
+            if let Some(proof_format) = request.proof_format.as_deref() {
+                if proof_format != "json-base64" {
+                    return Err(GiftApiError::bad_request("invalid Android proof format"));
+                }
+            }
+            Some(verify_android_local_proof(
+                &device_token_bytes,
+                &attestation_bytes,
+                key_id,
+                &challenge,
+                &wallet_address,
+            )?)
+        } else {
+            None
+        };
+
+        if self.config.require_appattest && !skip_device_attestation && !is_android_claim {
             let verifier = self.require_app_attest_verifier()?;
             verifier
                 .verify_attestation(&attestation_bytes, key_id, &challenge)
@@ -506,11 +542,12 @@ impl GiftService {
                 })?;
         }
 
-        let device_fingerprint = sha256_hex(&device_token_bytes);
+        let device_fingerprint =
+            android_device_fingerprint.unwrap_or_else(|| sha256_hex(&device_token_bytes));
         let normalized_ip = normalize_source_ip(source_ip.as_deref());
         self.enforce_ip_rate_limit(normalized_ip.as_deref(), now).await?;
 
-        let skip_devicecheck = skip_device_attestation;
+        let skip_devicecheck = skip_device_attestation || is_android_claim;
         if self.config.require_devicecheck && !skip_devicecheck {
             let client = self.require_devicecheck_client()?;
             let already_claimed = client
@@ -1337,6 +1374,109 @@ fn validate_base64_blob(value: &str, error_message: &'static str) -> Result<Vec<
     general_purpose::STANDARD
         .decode(trimmed.as_bytes())
         .map_err(|_| GiftApiError::bad_request(error_message))
+}
+
+fn verify_android_local_proof(
+    device_token_bytes: &[u8],
+    attestation_bytes: &[u8],
+    key_id: &str,
+    challenge: &str,
+    wallet_address: &str,
+) -> Result<String, GiftApiError> {
+    let device_payload = parse_android_json(device_token_bytes, "invalid Android device token")?;
+    let attestation_payload =
+        parse_android_json(attestation_bytes, "invalid Android attestation");
+    let attestation_payload = attestation_payload?;
+
+    require_json_string(&device_payload, "platform", "android", "invalid Android device platform")?;
+    require_json_string(
+        &device_payload,
+        "schema",
+        ANDROID_DEVICE_SCHEMA,
+        "invalid Android device schema",
+    )?;
+    require_json_string(
+        &attestation_payload,
+        "platform",
+        "android",
+        "invalid Android attestation platform",
+    )?;
+    require_json_string(
+        &attestation_payload,
+        "schema",
+        ANDROID_LOCAL_PROOF_SCHEMA,
+        "invalid Android attestation schema",
+    )?;
+
+    let package_name = json_string(&device_payload, "packageName")
+        .ok_or_else(|| GiftApiError::bad_request("missing Android package name"))?;
+    if package_name != "com.kbeam.android" {
+        return Err(GiftApiError::bad_request("invalid Android package name"));
+    }
+    require_json_string(
+        &attestation_payload,
+        "packageName",
+        &package_name,
+        "Android attestation package mismatch",
+    )?;
+
+    let challenge_hash = json_string(&attestation_payload, "challengeSha256")
+        .ok_or_else(|| GiftApiError::bad_request("missing Android challenge hash"))?;
+    if challenge_hash != sha256_hex(challenge.as_bytes()) {
+        return Err(GiftApiError::bad_request("Android challenge hash mismatch"));
+    }
+
+    let wallet_hash = json_string(&device_payload, "walletAddressSha256")
+        .ok_or_else(|| GiftApiError::bad_request("missing Android wallet hash"))?;
+    if wallet_hash != sha256_hex(wallet_address.as_bytes()) {
+        return Err(GiftApiError::bad_request("Android wallet hash mismatch"));
+    }
+
+    let installation_id = json_string(&device_payload, "installationId")
+        .ok_or_else(|| GiftApiError::bad_request("missing Android installation id"))?;
+    if installation_id.len() < 16 {
+        return Err(GiftApiError::bad_request("invalid Android installation id"));
+    }
+    let android_id_hash = json_string(&device_payload, "androidIdSha256")
+        .ok_or_else(|| GiftApiError::bad_request("missing Android id hash"))?;
+    if android_id_hash.len() != 64 || !android_id_hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(GiftApiError::bad_request("invalid Android id hash"));
+    }
+
+    let expected_key_prefix = format!(
+        "android-local-proof-v1:{}",
+        &sha256_hex(format!("{}:{}", installation_id, challenge_hash).as_bytes())[..24]
+    );
+    if key_id != expected_key_prefix {
+        return Err(GiftApiError::bad_request("Android proof key id mismatch"));
+    }
+
+    Ok(sha256_hex(
+        format!("{package_name}:{android_id_hash}:{installation_id}").as_bytes(),
+    ))
+}
+
+fn parse_android_json(bytes: &[u8], error_message: &'static str) -> Result<serde_json::Value, GiftApiError> {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .map_err(|_| GiftApiError::bad_request(error_message))
+}
+
+fn require_json_string(
+    payload: &serde_json::Value,
+    key: &str,
+    expected: &str,
+    error_message: &'static str,
+) -> Result<(), GiftApiError> {
+    let value = json_string(payload, key).ok_or_else(|| GiftApiError::bad_request(error_message))?;
+    if value == expected {
+        Ok(())
+    } else {
+        Err(GiftApiError::bad_request(error_message))
+    }
+}
+
+fn json_string<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    payload.get(key)?.as_str()?.trim().split('\0').next()
 }
 
 fn normalize_wallet_address(value: &str) -> Option<String> {

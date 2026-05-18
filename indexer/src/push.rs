@@ -784,6 +784,23 @@ impl PushService {
             .apns_bundle_id
             .as_deref()
             .and_then(normalize_bundle_id);
+        if matches!(message_type, PushMessageType::Contextual)
+            && let Some(alias) = contextual_alias
+        {
+            let matching_wallets = registrations
+                .values()
+                .filter(|registration| registration.aliases.iter().any(|value| value == alias))
+                .map(|registration| registration.wallet_address.as_str())
+                .collect::<HashSet<_>>();
+            if matching_wallets.len() > 1 {
+                warn!(
+                    alias = %alias,
+                    wallet_count = matching_wallets.len(),
+                    "Skipping contextual push dispatch for alias registered by multiple wallets"
+                );
+                return Vec::new();
+            }
+        }
 
         registrations
             .values()
@@ -2335,6 +2352,90 @@ mod tests {
             assert_eq!(apns_targets[0].device_token, "apns-allowed");
             assert_eq!(fcm_targets.len(), 1);
             assert_eq!(fcm_targets[0].device_token, "fcm-token");
+        });
+    }
+
+    #[test]
+    fn contextual_matching_suppresses_alias_registered_by_multiple_wallets() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let mut first = test_registration(
+                "apns-first",
+                "apns",
+                Some("com.kbeam.app"),
+                "kaspa:qfirst",
+            );
+            first.aliases = vec!["shared-alias__kbp1".to_string()];
+            let mut second = test_registration(
+                "apns-second",
+                "apns",
+                Some("com.kbeam.app"),
+                "kaspa:qsecond",
+            );
+            second.aliases = vec!["shared-alias__kbp1".to_string()];
+
+            let mut registrations = HashMap::new();
+            registrations.insert(first.device_token.clone(), first);
+            registrations.insert(second.device_token.clone(), second);
+
+            let service = test_service(registrations);
+            let targets = service
+                .matching_registrations(
+                    PushMessageType::Contextual,
+                    "kaspa:qsender",
+                    None,
+                    Some("shared-alias__kbp1"),
+                    "apns",
+                )
+                .await;
+
+            assert!(targets.is_empty());
+        });
+    }
+
+    #[test]
+    fn contextual_matching_allows_same_alias_for_same_wallet_devices() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let mut first = test_registration(
+                "apns-first",
+                "apns",
+                Some("com.kbeam.app"),
+                "kaspa:qwallet",
+            );
+            first.aliases = vec!["shared-alias__kbp1".to_string()];
+            let mut second = test_registration(
+                "apns-second",
+                "apns",
+                Some("com.kbeam.app"),
+                "kaspa:qwallet",
+            );
+            second.aliases = vec!["shared-alias__kbp1".to_string()];
+
+            let mut registrations = HashMap::new();
+            registrations.insert(first.device_token.clone(), first);
+            registrations.insert(second.device_token.clone(), second);
+
+            let service = test_service(registrations);
+            let targets = service
+                .matching_registrations(
+                    PushMessageType::Contextual,
+                    "kaspa:qsender",
+                    None,
+                    Some("shared-alias__kbp1"),
+                    "apns",
+                )
+                .await;
+
+            assert_eq!(targets.len(), 2);
         });
     }
 

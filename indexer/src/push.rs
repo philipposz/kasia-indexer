@@ -271,6 +271,8 @@ pub struct PushRegistrationRequest {
     pub watch_pulse_reply_addresses: Vec<String>,
     pub primary_address: Option<String>,
     pub aliases: Option<Vec<String>>,
+    #[serde(default)]
+    pub replace_wallet_devices: bool,
     pub auth: Option<PushAuthRequest>,
 }
 
@@ -1080,6 +1082,26 @@ impl PushService {
                 new_wallet = %auth.wallet_address,
                 "Rebinding push device token to newly authenticated wallet"
             );
+        }
+
+        if request.replace_wallet_devices {
+            let wallet_pubkey = auth.wallet_pubkey.as_str();
+            let wallet_address = auth.wallet_address.as_str();
+            let before = registrations.len();
+            registrations.retain(|registration_token, registration| {
+                registration_token == &token
+                    || (registration.wallet_pubkey != wallet_pubkey
+                        && registration.wallet_address != wallet_address
+                        && registration.primary_address.as_deref() != Some(wallet_address))
+            });
+            let removed = before.saturating_sub(registrations.len());
+            if removed > 0 {
+                info!(
+                    wallet = %auth.wallet_address,
+                    removed,
+                    "Removed stale push registrations for wallet during replace-device registration"
+                );
+            }
         }
 
         registrations.insert(
@@ -2396,6 +2418,7 @@ mod tests {
                     watch_pulse_reply_addresses: vec!["kaspa:qnewwallet".to_string()],
                     primary_address: Some("kaspa:qnewwallet".to_string()),
                     aliases: Some(vec!["new-alias__kbp1".to_string()]),
+                    replace_wallet_devices: false,
                     auth: Some(PushAuthRequest {
                         wallet_pubkey: "11".repeat(32),
                         wallet_address: "kaspa:qnewwallet".to_string(),
@@ -2417,6 +2440,62 @@ mod tests {
             assert!(rebound.watched_addresses.contains("kaspa:qnewwallet"));
             assert_eq!(rebound.aliases, vec!["new-alias__kbp1".to_string()]);
             assert_ne!(rebound.created_at_ms, 1);
+        });
+    }
+
+    #[test]
+    fn register_can_replace_other_devices_for_same_wallet() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let mut registrations = HashMap::new();
+            registrations.insert(
+                "apns-old".to_string(),
+                test_registration("apns-old", "apns", Some("com.kbeam.app"), "kaspa:qwallet"),
+            );
+            registrations.insert(
+                "fcm-old".to_string(),
+                test_registration("fcm-old", "fcm", None, "kaspa:qwallet"),
+            );
+            let mut other_registration =
+                test_registration("apns-other", "apns", Some("com.kbeam.app"), "kaspa:qother");
+            other_registration.wallet_pubkey = "11".repeat(32);
+            registrations.insert("apns-other".to_string(), other_registration);
+
+            let service = test_service(registrations);
+            let challenge = service.create_challenge().await;
+            let new_token = "aa".repeat(32);
+            service
+                .register(PushRegistrationRequest {
+                    device_token: new_token.clone(),
+                    token_type: "apns".to_string(),
+                    platform: "ios".to_string(),
+                    app_bundle_id: Some("com.kbeam.app".to_string()),
+                    watched_addresses: vec!["kaspa:qwallet".to_string()],
+                    watch_pulse_reply_addresses: vec!["kaspa:qwallet".to_string()],
+                    primary_address: Some("kaspa:qwallet".to_string()),
+                    aliases: Some(vec![]),
+                    replace_wallet_devices: true,
+                    auth: Some(PushAuthRequest {
+                        wallet_pubkey: "00".repeat(32),
+                        wallet_address: "kaspa:qwallet".to_string(),
+                        nonce: challenge.nonce,
+                        timestamp_ms: challenge.issued_at_ms,
+                        expires_at_ms: challenge.expires_at_ms,
+                        signature: "signature".to_string(),
+                    }),
+                })
+                .await
+                .unwrap();
+
+            let registrations = service.registrations.read().await;
+            assert!(registrations.contains_key(&new_token));
+            assert!(!registrations.contains_key("apns-old"));
+            assert!(!registrations.contains_key("fcm-old"));
+            assert!(registrations.contains_key("apns-other"));
         });
     }
 

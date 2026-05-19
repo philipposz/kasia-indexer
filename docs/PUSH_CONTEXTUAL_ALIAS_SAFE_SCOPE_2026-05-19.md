@@ -12,13 +12,15 @@ Contextual push matching now scopes by exact alias first:
 
 - if the alias belongs to a single wallet, dispatch to that wallet even when the chain receiver does not match;
 - if the alias is registered by multiple wallets and the chain receiver identifies one wallet, dispatch only to that wallet;
+- if the chain receiver is the sender itself, treat it as a contextual self-spend and exclude the sender registration before choosing a target;
+- if only the sender registration matches an alias, do not dispatch a push;
 - if the alias is registered by multiple wallets and no receiver scope can disambiguate it, drop the push to avoid another push fan-out.
 
 Silent aliases remain suppressed before target matching.
 
 ## Verification
 
-Added a unit test covering the normal single-wallet alias case where the chain receiver differs from the chat peer. Existing tests still cover duplicate alias suppression and receiver-scoped duplicate alias dispatch.
+Added unit tests covering the normal single-wallet alias case where the chain receiver differs from the chat peer, sender exclusion for contextual self-spends, and sender-only suppression. Existing tests still cover duplicate alias suppression and receiver-scoped duplicate alias dispatch.
 
 ## Rollback
 

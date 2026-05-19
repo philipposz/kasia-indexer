@@ -21,6 +21,7 @@ const PUSH_SUPPRESSED_ALIAS_SUFFIX: &str = "__kbs1";
 const PUSH_VISIBLE_ALIAS_SUFFIX: &str = "__kbp1";
 const LEGACY_PUSH_SUPPRESSED_ALIAS_SUFFIX: &str = "__silent";
 const LEGACY_PUSH_VISIBLE_ALIAS_SUFFIX: &str = "__push";
+const CONTEXTUAL_ALIAS_DUPLICATE_FRESHNESS_MARGIN_MS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContextualAliasPolicy {
@@ -822,19 +823,30 @@ impl PushService {
                 .map(|registration| registration.wallet_address.as_str())
                 .collect::<HashSet<_>>();
             if matching_wallets.len() > 1 {
-                warn!(
-                    alias = %alias,
-                    wallet_count = matching_wallets.len(),
-                    "Skipping contextual push dispatch for alias registered by multiple wallets"
-                );
-                return Vec::new();
+                if let Some(fresh_wallet) = freshest_contextual_wallet(wallet_scope) {
+                    info!(
+                        alias = %alias,
+                        wallet_count = matching_wallets.len(),
+                        wallet = %fresh_wallet,
+                        "Scoped duplicate contextual alias to freshest wallet registration"
+                    );
+                    Some(HashSet::from([fresh_wallet]))
+                } else {
+                    warn!(
+                        alias = %alias,
+                        wallet_count = matching_wallets.len(),
+                        "Skipping contextual push dispatch for alias registered by multiple wallets"
+                    );
+                    return Vec::new();
+                }
+            } else {
+                Some(
+                    matching_wallets
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<HashSet<_>>(),
+                )
             }
-            Some(
-                matching_wallets
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect::<HashSet<_>>(),
-            )
         } else {
             None
         };
@@ -2071,6 +2083,32 @@ fn registration_matches_address(registration: &DeviceRegistration, address: &str
     registration.wallet_address == address || registration.primary_address.as_deref() == Some(address)
 }
 
+fn freshest_contextual_wallet(registrations: &[&DeviceRegistration]) -> Option<String> {
+    let mut wallet_updates: HashMap<&str, u64> = HashMap::new();
+    for registration in registrations {
+        wallet_updates
+            .entry(registration.wallet_address.as_str())
+            .and_modify(|updated_at| *updated_at = (*updated_at).max(registration.updated_at_ms))
+            .or_insert(registration.updated_at_ms);
+    }
+
+    if wallet_updates.len() <= 1 {
+        return None;
+    }
+
+    let mut ordered = wallet_updates.into_iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| right.1.cmp(&left.1));
+    let (freshest_wallet, freshest_updated_at) = ordered[0];
+    let (_, second_updated_at) = ordered[1];
+    if freshest_updated_at
+        >= second_updated_at.saturating_add(CONTEXTUAL_ALIAS_DUPLICATE_FRESHNESS_MARGIN_MS)
+    {
+        Some(freshest_wallet.to_string())
+    } else {
+        None
+    }
+}
+
 fn extract_contextual_alias(payload: &[u8]) -> Option<String> {
     let payload = std::str::from_utf8(payload).ok()?;
     let mut parts = payload.splitn(5, ':');
@@ -2594,6 +2632,54 @@ mod tests {
 
             assert_eq!(targets.len(), 1);
             assert_eq!(targets[0].device_token, "apns-receiver");
+        });
+    }
+
+    #[test]
+    fn contextual_matching_scopes_duplicate_alias_to_freshest_wallet() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let mut fresh = test_registration(
+                "fcm-fresh",
+                "fcm",
+                None,
+                "kaspa:qfresh",
+            );
+            fresh.aliases = vec!["shared-alias__kbp1".to_string()];
+            fresh.updated_at_ms = 10_000_000;
+
+            let mut stale = test_registration(
+                "apns-stale",
+                "apns",
+                Some("com.kbeam.app"),
+                "kaspa:qstale",
+            );
+            stale.aliases = vec!["shared-alias__kbp1".to_string()];
+            stale.updated_at_ms = fresh
+                .updated_at_ms
+                .saturating_sub(CONTEXTUAL_ALIAS_DUPLICATE_FRESHNESS_MARGIN_MS + 1);
+
+            let mut registrations = HashMap::new();
+            registrations.insert(fresh.device_token.clone(), fresh);
+            registrations.insert(stale.device_token.clone(), stale);
+
+            let service = test_service(registrations);
+            let targets = service
+                .matching_registrations(
+                    PushMessageType::Contextual,
+                    "kaspa:qsender",
+                    Some("kaspa:qsender"),
+                    Some("shared-alias__kbp1"),
+                    "fcm",
+                )
+                .await;
+
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].device_token, "fcm-fresh");
         });
     }
 

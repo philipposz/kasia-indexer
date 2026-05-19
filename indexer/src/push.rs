@@ -787,9 +787,26 @@ impl PushService {
         if matches!(message_type, PushMessageType::Contextual)
             && let Some(alias) = contextual_alias
         {
-            let matching_wallets = registrations
+            let matching_registrations = registrations
                 .values()
                 .filter(|registration| registration.aliases.iter().any(|value| value == alias))
+                .collect::<Vec<_>>();
+            let receiver_scoped_registrations = receiver_address
+                .map(|receiver| {
+                    matching_registrations
+                        .iter()
+                        .copied()
+                        .filter(|registration| registration_matches_receiver(registration, receiver))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let wallet_scope = if receiver_scoped_registrations.is_empty() {
+                matching_registrations.as_slice()
+            } else {
+                receiver_scoped_registrations.as_slice()
+            };
+            let matching_wallets = wallet_scope
+                .iter()
                 .map(|registration| registration.wallet_address.as_str())
                 .collect::<HashSet<_>>();
             if matching_wallets.len() > 1 {
@@ -821,6 +838,9 @@ impl PushService {
                         return false;
                     };
                     registration.aliases.iter().any(|value| value == alias)
+                        && receiver_address
+                            .map(|receiver| registration_matches_receiver(registration, receiver))
+                            .unwrap_or(true)
                 }
                 PushMessageType::Handshake | PushMessageType::Payment => {
                     let Some(receiver) = receiver_address else {
@@ -2026,6 +2046,10 @@ fn normalize_aliases(values: Vec<String>) -> Vec<String> {
     aliases
 }
 
+fn registration_matches_receiver(registration: &DeviceRegistration, receiver: &str) -> bool {
+    registration.wallet_address == receiver || registration.primary_address.as_deref() == Some(receiver)
+}
+
 fn extract_contextual_alias(payload: &[u8]) -> Option<String> {
     let payload = std::str::from_utf8(payload).ok()?;
     let mut parts = payload.splitn(5, ':');
@@ -2394,6 +2418,49 @@ mod tests {
                 .await;
 
             assert!(targets.is_empty());
+        });
+    }
+
+    #[test]
+    fn contextual_matching_scopes_duplicate_alias_to_receiver_wallet() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let mut receiver = test_registration(
+                "apns-receiver",
+                "apns",
+                Some("com.kbeam.app"),
+                "kaspa:qreceiver",
+            );
+            receiver.aliases = vec!["shared-alias__kbp1".to_string()];
+            let mut stale = test_registration(
+                "apns-stale",
+                "apns",
+                Some("com.kbeam.app"),
+                "kaspa:qstale",
+            );
+            stale.aliases = vec!["shared-alias__kbp1".to_string()];
+
+            let mut registrations = HashMap::new();
+            registrations.insert(receiver.device_token.clone(), receiver);
+            registrations.insert(stale.device_token.clone(), stale);
+
+            let service = test_service(registrations);
+            let targets = service
+                .matching_registrations(
+                    PushMessageType::Contextual,
+                    "kaspa:qsender",
+                    Some("kaspa:qreceiver"),
+                    Some("shared-alias__kbp1"),
+                    "apns",
+                )
+                .await;
+
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].device_token, "apns-receiver");
         });
     }
 

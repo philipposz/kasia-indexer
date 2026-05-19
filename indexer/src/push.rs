@@ -784,7 +784,7 @@ impl PushService {
             .apns_bundle_id
             .as_deref()
             .and_then(normalize_bundle_id);
-        if matches!(message_type, PushMessageType::Contextual)
+        let contextual_wallet_scope = if matches!(message_type, PushMessageType::Contextual)
             && let Some(alias) = contextual_alias
         {
             let matching_registrations = registrations
@@ -817,7 +817,15 @@ impl PushService {
                 );
                 return Vec::new();
             }
-        }
+            Some(
+                matching_wallets
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<HashSet<_>>(),
+            )
+        } else {
+            None
+        };
 
         registrations
             .values()
@@ -838,8 +846,9 @@ impl PushService {
                         return false;
                     };
                     registration.aliases.iter().any(|value| value == alias)
-                        && receiver_address
-                            .map(|receiver| registration_matches_receiver(registration, receiver))
+                        && contextual_wallet_scope
+                            .as_ref()
+                            .map(|wallets| wallets.contains(&registration.wallet_address))
                             .unwrap_or(true)
                 }
                 PushMessageType::Handshake | PushMessageType::Payment => {
@@ -2418,6 +2427,41 @@ mod tests {
                 .await;
 
             assert!(targets.is_empty());
+        });
+    }
+
+    #[test]
+    fn contextual_matching_allows_single_wallet_alias_when_receiver_does_not_match() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let mut receiver = test_registration(
+                "apns-receiver",
+                "apns",
+                Some("com.kbeam.app"),
+                "kaspa:qreceiver",
+            );
+            receiver.aliases = vec!["direct-alias__kbp1".to_string()];
+
+            let mut registrations = HashMap::new();
+            registrations.insert(receiver.device_token.clone(), receiver);
+
+            let service = test_service(registrations);
+            let targets = service
+                .matching_registrations(
+                    PushMessageType::Contextual,
+                    "kaspa:qsender",
+                    Some("kaspa:qchainreceiver"),
+                    Some("direct-alias__kbp1"),
+                    "apns",
+                )
+                .await;
+
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].device_token, "apns-receiver");
         });
     }
 

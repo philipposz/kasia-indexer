@@ -3,6 +3,7 @@ use crate::context::IndexerContext;
 use anyhow::Context;
 use axum::http::StatusCode;
 use indexer_actors::block_processor::{PushDispatchEvent, PushMessageType};
+use indexer_actors::metrics::SharedMetrics;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use kaspa_rpc_core::RpcNetworkType;
 use reqwest::StatusCode as HttpStatusCode;
@@ -22,6 +23,7 @@ const PUSH_SUPPRESSED_ALIAS_SUFFIX: &str = "__kbs1";
 const PUSH_VISIBLE_ALIAS_SUFFIX: &str = "__kbp1";
 const LEGACY_PUSH_SUPPRESSED_ALIAS_SUFFIX: &str = "__silent";
 const LEGACY_PUSH_VISIBLE_ALIAS_SUFFIX: &str = "__push";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContextualAliasPolicy {
     Visible,
@@ -47,6 +49,7 @@ pub struct PushService {
     recent_dispatches: Arc<Mutex<HashMap<String, u64>>>,
     dispatch_dedupe_ttl_ms: u64,
     dispatch_counters: Arc<PushDispatchCounters>,
+    metrics: SharedMetrics,
 }
 
 #[derive(Clone, Debug)]
@@ -175,7 +178,10 @@ struct DeviceRegistration {
 
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ContextualPushRoute {
+    #[serde(alias = "sender_wallet", alias = "sender_address")]
     pub peer_address: String,
+    #[serde(default, alias = "receiver_wallet", alias = "receiver_address")]
+    pub receiver_address: Option<String>,
     pub aliases: Vec<String>,
 }
 
@@ -348,7 +354,10 @@ pub struct PulseReplyPushEvent {
 }
 
 impl PushService {
-    pub async fn from_context(context: &IndexerContext) -> anyhow::Result<Self> {
+    pub async fn from_context(
+        context: &IndexerContext,
+        metrics: SharedMetrics,
+    ) -> anyhow::Result<Self> {
         let config = PushConfig::from_env();
         let registrations_path = read_env_string("PUSH_REGISTRATIONS_PATH")
             .map(PathBuf::from)
@@ -393,6 +402,7 @@ impl PushService {
             recent_dispatches: Arc::new(Mutex::new(HashMap::new())),
             dispatch_dedupe_ttl_ms: 15 * 60 * 1000,
             dispatch_counters: Arc::new(PushDispatchCounters::default()),
+            metrics,
         })
     }
 
@@ -830,6 +840,8 @@ impl PushService {
                 if !contact_request_registrations.is_empty() {
                     contact_request_registrations
                 } else if !non_sender_registrations.is_empty() {
+                    self.metrics
+                        .increment_contextual_push_skipped_ambiguous_receiver(token_type);
                     warn!(
                         alias = %alias,
                         sender = %sender_address,
@@ -852,11 +864,14 @@ impl PushService {
                 .map(|registration| registration.wallet_address.as_str())
                 .collect::<HashSet<_>>();
             if matching_wallets.len() > 1 {
+                self.metrics
+                    .increment_contextual_push_skipped_ambiguous_receiver(token_type);
                 warn!(
                     alias = %alias,
+                    sender = %sender_address,
+                    token_type = %token_type,
                     wallet_count = matching_wallets.len(),
-                    token_type,
-                    "Skipping contextual push dispatch for alias registered by multiple wallets"
+                    "Skipping contextual push dispatch because alias matched but receiver wallet was not unique"
                 );
                 return Vec::new();
             } else {
@@ -1153,8 +1168,10 @@ impl PushService {
         let watched_addresses = normalize_addresses(request.watched_addresses);
         let watch_pulse_reply_addresses = normalize_addresses(request.watch_pulse_reply_addresses);
         let primary_address = normalize_optional_address(request.primary_address.as_deref());
-        let contextual_routes = normalize_contextual_routes(request.contextual_routes);
-        let aliases = derived_contextual_registration_aliases(&auth.wallet_address, &contextual_routes);
+        let contextual_routes =
+            normalize_contextual_routes(&auth.wallet_address, request.contextual_routes);
+        let aliases =
+            derived_contextual_registration_aliases(&auth.wallet_address, &contextual_routes);
 
         let mut registrations = self.registrations.write().await;
         let existing_registration = registrations.get(&token).cloned();
@@ -1234,8 +1251,10 @@ impl PushService {
         let watched_addresses = normalize_addresses(request.watched_addresses);
         let watch_pulse_reply_addresses = normalize_addresses(request.watch_pulse_reply_addresses);
         let primary_address = normalize_optional_address(request.primary_address.as_deref());
-        let contextual_routes = normalize_contextual_routes(request.contextual_routes);
-        let aliases = derived_contextual_registration_aliases(&auth.wallet_address, &contextual_routes);
+        let contextual_routes =
+            normalize_contextual_routes(&auth.wallet_address, request.contextual_routes);
+        let aliases =
+            derived_contextual_registration_aliases(&auth.wallet_address, &contextual_routes);
 
         let mut registrations = self.registrations.write().await;
         let registration = registrations
@@ -2103,13 +2122,27 @@ fn normalize_aliases(values: Vec<String>) -> Vec<String> {
     aliases
 }
 
-fn normalize_contextual_routes(values: Vec<ContextualPushRoute>) -> Vec<ContextualPushRoute> {
-    let mut route_aliases: HashMap<String, Vec<String>> = HashMap::new();
+fn normalize_contextual_routes(
+    wallet_address: &str,
+    values: Vec<ContextualPushRoute>,
+) -> Vec<ContextualPushRoute> {
+    let Some(authenticated_receiver) = normalize_address(wallet_address) else {
+        return Vec::new();
+    };
+    let mut route_aliases: HashMap<(String, String), Vec<String>> = HashMap::new();
     for value in values {
         let Some(peer_address) = normalize_address(&value.peer_address) else {
             continue;
         };
-        let entry = route_aliases.entry(peer_address).or_default();
+        let receiver_address = value
+            .receiver_address
+            .as_deref()
+            .and_then(normalize_address)
+            .filter(|value| value == &authenticated_receiver)
+            .unwrap_or_else(|| authenticated_receiver.clone());
+        let entry = route_aliases
+            .entry((peer_address, receiver_address))
+            .or_default();
         for alias in normalize_aliases(value.aliases) {
             if !entry.contains(&alias) {
                 entry.push(alias);
@@ -2119,18 +2152,23 @@ fn normalize_contextual_routes(values: Vec<ContextualPushRoute>) -> Vec<Contextu
 
     let mut routes = route_aliases
         .into_iter()
-        .filter_map(|(peer_address, aliases)| {
+        .filter_map(|((peer_address, receiver_address), aliases)| {
             if aliases.is_empty() {
                 None
             } else {
                 Some(ContextualPushRoute {
                     peer_address,
+                    receiver_address: Some(receiver_address),
                     aliases,
                 })
             }
         })
         .collect::<Vec<_>>();
-    routes.sort_by(|left, right| left.peer_address.cmp(&right.peer_address));
+    routes.sort_by(|left, right| {
+        left.peer_address
+            .cmp(&right.peer_address)
+            .then_with(|| left.receiver_address.cmp(&right.receiver_address))
+    });
     routes
 }
 
@@ -2162,7 +2200,13 @@ fn registration_allows_contextual_alias(
 ) -> bool {
     registration_allows_contact_request_inbox_alias(registration, alias)
         || registration.contextual_routes.iter().any(|route| {
-            route.peer_address == sender_address && route.aliases.iter().any(|value| value == alias)
+            route.peer_address == sender_address
+                && route
+                    .receiver_address
+                    .as_deref()
+                    .unwrap_or(registration.wallet_address.as_str())
+                    == registration.wallet_address
+                && route.aliases.iter().any(|value| value == alias)
         })
 }
 
@@ -2176,7 +2220,8 @@ fn registration_allows_contact_request_inbox_alias(
 }
 
 fn registration_matches_address(registration: &DeviceRegistration, address: &str) -> bool {
-    registration.wallet_address == address || registration.primary_address.as_deref() == Some(address)
+    registration.wallet_address == address
+        || registration.primary_address.as_deref() == Some(address)
 }
 
 fn contact_request_inbox_watch_aliases(wallet_address: &str) -> Vec<String> {
@@ -2532,20 +2577,18 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let mut first = test_registration(
-                "apns-first",
-                "apns",
-                Some("com.kbeam.app"),
-                "kaspa:qfirst",
-            );
-            first.contextual_routes = vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
+            let mut first =
+                test_registration("apns-first", "apns", Some("com.kbeam.app"), "kaspa:qfirst");
+            first.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
             let mut second = test_registration(
                 "apns-second",
                 "apns",
                 Some("com.kbeam.app"),
                 "kaspa:qsecond",
             );
-            second.contextual_routes = vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
+            second.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
 
             let mut registrations = HashMap::new();
             registrations.insert(first.device_token.clone(), first);
@@ -2574,12 +2617,8 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let mut stale = test_registration(
-                "apns-stale",
-                "apns",
-                Some("com.kbeam.app"),
-                "kaspa:qstale",
-            );
+            let mut stale =
+                test_registration("apns-stale", "apns", Some("com.kbeam.app"), "kaspa:qstale");
             stale.aliases = vec!["free-alias__kbp1".to_string()];
 
             let mut registrations = HashMap::new();
@@ -2652,7 +2691,8 @@ mod tests {
                 Some("com.kbeam.app"),
                 "kaspa:qreceiver",
             );
-            receiver.contextual_routes = vec![test_contextual_route("kaspa:qsender", "direct-alias__kbp1")];
+            receiver.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "direct-alias__kbp1")];
 
             let mut registrations = HashMap::new();
             registrations.insert(receiver.device_token.clone(), receiver);
@@ -2686,14 +2726,16 @@ mod tests {
                 Some("com.kbeam.app"),
                 "kaspa:qsender",
             );
-            sender.contextual_routes = vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
+            sender.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
             let mut receiver = test_registration(
                 "apns-receiver",
                 "apns",
                 Some("com.kbeam.app"),
                 "kaspa:qreceiver",
             );
-            receiver.contextual_routes = vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
+            receiver.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
 
             let mut registrations = HashMap::new();
             registrations.insert(sender.device_token.clone(), sender);
@@ -2728,7 +2770,8 @@ mod tests {
                 Some("com.kbeam.app"),
                 "kaspa:qsender",
             );
-            sender.contextual_routes = vec![test_contextual_route("kaspa:qsender", "sender-alias__kbp1")];
+            sender.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "sender-alias__kbp1")];
 
             let mut registrations = HashMap::new();
             registrations.insert(sender.device_token.clone(), sender);
@@ -2762,14 +2805,12 @@ mod tests {
                 Some("com.kbeam.app"),
                 "kaspa:qreceiver",
             );
-            receiver.contextual_routes = vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
-            let mut stale = test_registration(
-                "apns-stale",
-                "apns",
-                Some("com.kbeam.app"),
-                "kaspa:qstale",
-            );
-            stale.contextual_routes = vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
+            receiver.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
+            let mut stale =
+                test_registration("apns-stale", "apns", Some("com.kbeam.app"), "kaspa:qstale");
+            stale.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
 
             let mut registrations = HashMap::new();
             registrations.insert(receiver.device_token.clone(), receiver);
@@ -2805,12 +2846,8 @@ mod tests {
                 vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
             android_receiver.updated_at_ms = 10_000_000;
 
-            let mut ios_peer = test_registration(
-                "apns-peer",
-                "apns",
-                Some("com.kbeam.app"),
-                "kaspa:qios",
-            );
+            let mut ios_peer =
+                test_registration("apns-peer", "apns", Some("com.kbeam.app"), "kaspa:qios");
             ios_peer.contextual_routes =
                 vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
             ios_peer.updated_at_ms = android_receiver.updated_at_ms.saturating_sub(120_000);
@@ -2841,6 +2878,20 @@ mod tests {
 
             assert!(fcm_targets.is_empty());
             assert!(apns_targets.is_empty());
+            assert_eq!(
+                service
+                    .metrics
+                    .snapshot()
+                    .contextual_push_skipped_ambiguous_receiver_fcm,
+                1
+            );
+            assert_eq!(
+                service
+                    .metrics
+                    .snapshot()
+                    .contextual_push_skipped_ambiguous_receiver_apns,
+                1
+            );
         });
     }
 
@@ -2852,20 +2903,18 @@ mod tests {
             .unwrap();
 
         runtime.block_on(async {
-            let mut first = test_registration(
-                "apns-first",
-                "apns",
-                Some("com.kbeam.app"),
-                "kaspa:qwallet",
-            );
-            first.contextual_routes = vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
+            let mut first =
+                test_registration("apns-first", "apns", Some("com.kbeam.app"), "kaspa:qwallet");
+            first.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
             let mut second = test_registration(
                 "apns-second",
                 "apns",
                 Some("com.kbeam.app"),
                 "kaspa:qwallet",
             );
-            second.contextual_routes = vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
+            second.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
 
             let mut registrations = HashMap::new();
             registrations.insert(first.device_token.clone(), first);
@@ -2965,7 +3014,10 @@ mod tests {
                     watched_addresses: vec!["kaspa:qnewwallet".to_string()],
                     watch_pulse_reply_addresses: vec!["kaspa:qnewwallet".to_string()],
                     primary_address: Some("kaspa:qnewwallet".to_string()),
-                    contextual_routes: vec![test_contextual_route("kaspa:qpeer", "new-alias__kbp1")],
+                    contextual_routes: vec![test_contextual_route(
+                        "kaspa:qpeer",
+                        "new-alias__kbp1",
+                    )],
                     replace_wallet_devices: false,
                     auth: Some(PushAuthRequest {
                         wallet_pubkey: "11".repeat(32),
@@ -3079,6 +3131,7 @@ mod tests {
             recent_dispatches: Arc::new(Mutex::new(HashMap::new())),
             dispatch_dedupe_ttl_ms: 15 * 60 * 1000,
             dispatch_counters: Arc::new(PushDispatchCounters::default()),
+            metrics: indexer_actors::metrics::create_shared_metrics(),
         }
     }
 
@@ -3108,6 +3161,7 @@ mod tests {
     fn test_contextual_route(peer_address: &str, alias: &str) -> ContextualPushRoute {
         ContextualPushRoute {
             peer_address: peer_address.to_string(),
+            receiver_address: None,
             aliases: vec![alias.to_string()],
         }
     }

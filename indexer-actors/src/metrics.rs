@@ -38,6 +38,8 @@ pub struct IndexerMetricsSnapshot {
     pub unknown_sender_entries: u64,
     pub resolved_senders: u64,
     pub pruned_blocks: u64,
+    pub contextual_push_skipped_ambiguous_receiver_fcm: u64,
+    pub contextual_push_skipped_ambiguous_receiver_apns: u64,
 }
 
 impl Display for IndexerMetricsSnapshot {
@@ -95,6 +97,8 @@ pub struct IndexerMetrics {
     pub unknown_sender_entries: AtomicU64,
     pub resolved_sender: AtomicU64,
     pub pruned_blocks: AtomicU64,
+    pub contextual_push_skipped_ambiguous_receiver_fcm: AtomicU64,
+    pub contextual_push_skipped_ambiguous_receiver_apns: AtomicU64,
 }
 
 impl IndexerMetrics {
@@ -112,6 +116,8 @@ impl IndexerMetrics {
             unknown_sender_entries: AtomicU64::new(0),
             resolved_sender: Default::default(),
             pruned_blocks: Default::default(),
+            contextual_push_skipped_ambiguous_receiver_fcm: AtomicU64::new(0),
+            contextual_push_skipped_ambiguous_receiver_apns: AtomicU64::new(0),
         }
     }
 
@@ -129,6 +135,12 @@ impl IndexerMetrics {
             unknown_sender_entries: AtomicU64::new(snapshot.unknown_sender_entries),
             resolved_sender: AtomicU64::new(snapshot.resolved_senders),
             pruned_blocks: AtomicU64::new(snapshot.pruned_blocks),
+            contextual_push_skipped_ambiguous_receiver_fcm: AtomicU64::new(
+                snapshot.contextual_push_skipped_ambiguous_receiver_fcm,
+            ),
+            contextual_push_skipped_ambiguous_receiver_apns: AtomicU64::new(
+                snapshot.contextual_push_skipped_ambiguous_receiver_apns,
+            ),
         }
     }
 
@@ -146,6 +158,12 @@ impl IndexerMetrics {
             unknown_sender_entries: self.unknown_sender_entries.load(Ordering::Relaxed),
             resolved_senders: self.resolved_sender.load(Ordering::Relaxed),
             pruned_blocks: self.pruned_blocks.load(Ordering::Relaxed),
+            contextual_push_skipped_ambiguous_receiver_fcm: self
+                .contextual_push_skipped_ambiguous_receiver_fcm
+                .load(Ordering::Relaxed),
+            contextual_push_skipped_ambiguous_receiver_apns: self
+                .contextual_push_skipped_ambiguous_receiver_apns
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -232,6 +250,20 @@ impl IndexerMetrics {
 
     pub fn increment_resolved_senders(&self, count: u64) {
         self.resolved_sender.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn increment_contextual_push_skipped_ambiguous_receiver(&self, token_type: &str) {
+        match token_type {
+            "fcm" => {
+                self.contextual_push_skipped_ambiguous_receiver_fcm
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            "apns" => {
+                self.contextual_push_skipped_ambiguous_receiver_apns
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
     }
 }
 

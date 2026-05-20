@@ -13,17 +13,17 @@ use indexer_actors::virtual_chain_processor::{CompactHeader, VirtualProcessor};
 use indexer_db::headers::block_compact_headers::BlockCompactHeaderPartition;
 use indexer_db::headers::block_gaps::{BlockGap, BlockGapsPartition};
 use indexer_db::headers::daa_index::DaaIndexPartition;
+use indexer_db::messages::board::{
+    BoardClientGeneratedIdToPostIdPartition, BoardFollowByFollowerTargetPartition,
+    BoardFollowByTargetFollowerPartition, BoardPostByCreatedAtPartition, BoardPostByIdPartition,
+    BoardReactionByPostActorEmojiPartition, BoardReplyByParentCreatedAtPartition,
+    BoardReportByPostActorPartition,
+};
 use indexer_db::messages::contextual_message::{
     ContextualMessageBySenderPartition, TxIdToContextualMessagePartition,
 };
 use indexer_db::messages::handshake::{
     HandshakeByReceiverPartition, HandshakeBySenderPartition, TxIdToHandshakePartition,
-};
-use indexer_db::messages::board::{
-    BoardClientGeneratedIdToPostIdPartition, BoardPostByCreatedAtPartition, BoardPostByIdPartition,
-    BoardFollowByFollowerTargetPartition, BoardFollowByTargetFollowerPartition,
-    BoardReactionByPostActorEmojiPartition, BoardReplyByParentCreatedAtPartition,
-    BoardReportByPostActorPartition,
 };
 use indexer_db::messages::payment::{
     PaymentByReceiverPartition, PaymentBySenderPartition, TxIdToPaymentPartition,
@@ -105,8 +105,7 @@ async fn main() -> anyhow::Result<()> {
         BoardFollowByFollowerTargetPartition::new(&tx_keyspace)?;
     let board_follow_by_target_follower_partition =
         BoardFollowByTargetFollowerPartition::new(&tx_keyspace)?;
-    let board_report_by_post_actor_partition =
-        BoardReportByPostActorPartition::new(&tx_keyspace)?;
+    let board_report_by_post_actor_partition = BoardReportByPostActorPartition::new(&tx_keyspace)?;
     let tx_id_to_acceptance_partition = TxIDToAcceptancePartition::new(&tx_keyspace)?;
     let block_compact_header_partition = BlockCompactHeaderPartition::new(&tx_keyspace)?;
     let acceptance_to_tx_id_partition = AcceptingBlockToTxIDPartition::new(&tx_keyspace)?;
@@ -140,6 +139,8 @@ async fn main() -> anyhow::Result<()> {
         unknown_sender_entries: pending_sender_resolution_partition.len()? as u64,
         resolved_senders: 0,
         pruned_blocks: 0,
+        contextual_push_skipped_ambiguous_receiver_fcm: 0,
+        contextual_push_skipped_ambiguous_receiver_apns: 0,
     });
     let (block_intake_tx, block_intake_rx) = flume::bounded(4096);
     let (vcc_intake_tx, vcc_intake_rx) = flume::bounded(4096);
@@ -257,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
         })
         .take(synced_capacity)
         .collect::<Result<Vec<_>, _>>()?;
-    let push_service = push::PushService::from_context(&context).await?;
+    let push_service = push::PushService::from_context(&context, metrics.clone()).await?;
     let push_dispatch_handle =
         tokio::spawn(push_service.clone().run_dispatch_worker(push_event_rx));
     let gift_service = gift::GiftService::from_context(&context).await?;

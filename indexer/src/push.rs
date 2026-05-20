@@ -22,8 +22,6 @@ const PUSH_SUPPRESSED_ALIAS_SUFFIX: &str = "__kbs1";
 const PUSH_VISIBLE_ALIAS_SUFFIX: &str = "__kbp1";
 const LEGACY_PUSH_SUPPRESSED_ALIAS_SUFFIX: &str = "__silent";
 const LEGACY_PUSH_VISIBLE_ALIAS_SUFFIX: &str = "__push";
-const CONTEXTUAL_ALIAS_DUPLICATE_FRESHNESS_MARGIN_MS: u64 = 10 * 60 * 1000;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContextualAliasPolicy {
     Visible,
@@ -820,38 +818,47 @@ impl PushService {
                 })
                 .unwrap_or_default();
             let wallet_scope = if !receiver_scoped_registrations.is_empty() {
-                receiver_scoped_registrations.as_slice()
-            } else if !non_sender_registrations.is_empty() {
-                non_sender_registrations.as_slice()
+                receiver_scoped_registrations
             } else {
-                debug!(
-                    alias = %alias,
-                    sender = %sender_address,
-                    "Skipping contextual push dispatch because only sender registrations match alias"
-                );
-                return Vec::new();
+                let contact_request_registrations = non_sender_registrations
+                    .iter()
+                    .copied()
+                    .filter(|registration| {
+                        registration_allows_contact_request_inbox_alias(registration, alias)
+                    })
+                    .collect::<Vec<_>>();
+                if !contact_request_registrations.is_empty() {
+                    contact_request_registrations
+                } else if !non_sender_registrations.is_empty() {
+                    warn!(
+                        alias = %alias,
+                        sender = %sender_address,
+                        token_type,
+                        "Skipping contextual push dispatch because alias matched but receiver wallet was not unique"
+                    );
+                    return Vec::new();
+                } else {
+                    debug!(
+                        alias = %alias,
+                        sender = %sender_address,
+                        token_type,
+                        "Skipping contextual push dispatch because only sender registrations match alias"
+                    );
+                    return Vec::new();
+                }
             };
             let matching_wallets = wallet_scope
                 .iter()
                 .map(|registration| registration.wallet_address.as_str())
                 .collect::<HashSet<_>>();
             if matching_wallets.len() > 1 {
-                if let Some(fresh_wallet) = freshest_contextual_wallet(wallet_scope) {
-                    info!(
-                        alias = %alias,
-                        wallet_count = matching_wallets.len(),
-                        wallet = %fresh_wallet,
-                        "Scoped duplicate contextual alias to freshest wallet registration"
-                    );
-                    Some(HashSet::from([fresh_wallet]))
-                } else {
-                    warn!(
-                        alias = %alias,
-                        wallet_count = matching_wallets.len(),
-                        "Skipping contextual push dispatch for alias registered by multiple wallets"
-                    );
-                    return Vec::new();
-                }
+                warn!(
+                    alias = %alias,
+                    wallet_count = matching_wallets.len(),
+                    token_type,
+                    "Skipping contextual push dispatch for alias registered by multiple wallets"
+                );
+                return Vec::new();
             } else {
                 Some(
                     matching_wallets
@@ -2153,12 +2160,19 @@ fn registration_allows_contextual_alias(
     sender_address: &str,
     alias: &str,
 ) -> bool {
-    contact_request_inbox_watch_aliases(&registration.wallet_address)
-        .iter()
-        .any(|value| value == alias)
+    registration_allows_contact_request_inbox_alias(registration, alias)
         || registration.contextual_routes.iter().any(|route| {
             route.peer_address == sender_address && route.aliases.iter().any(|value| value == alias)
         })
+}
+
+fn registration_allows_contact_request_inbox_alias(
+    registration: &DeviceRegistration,
+    alias: &str,
+) -> bool {
+    contact_request_inbox_watch_aliases(&registration.wallet_address)
+        .iter()
+        .any(|value| value == alias)
 }
 
 fn registration_matches_address(registration: &DeviceRegistration, address: &str) -> bool {
@@ -2179,32 +2193,6 @@ fn contact_request_inbox_watch_aliases(wallet_address: &str) -> Vec<String> {
         format!("{base}{LEGACY_PUSH_SUPPRESSED_ALIAS_SUFFIX}"),
         format!("{base}{LEGACY_PUSH_VISIBLE_ALIAS_SUFFIX}"),
     ]
-}
-
-fn freshest_contextual_wallet(registrations: &[&DeviceRegistration]) -> Option<String> {
-    let mut wallet_updates: HashMap<&str, u64> = HashMap::new();
-    for registration in registrations {
-        wallet_updates
-            .entry(registration.wallet_address.as_str())
-            .and_modify(|updated_at| *updated_at = (*updated_at).max(registration.updated_at_ms))
-            .or_insert(registration.updated_at_ms);
-    }
-
-    if wallet_updates.len() <= 1 {
-        return None;
-    }
-
-    let mut ordered = wallet_updates.into_iter().collect::<Vec<_>>();
-    ordered.sort_by(|left, right| right.1.cmp(&left.1));
-    let (freshest_wallet, freshest_updated_at) = ordered[0];
-    let (_, second_updated_at) = ordered[1];
-    if freshest_updated_at
-        >= second_updated_at.saturating_add(CONTEXTUAL_ALIAS_DUPLICATE_FRESHNESS_MARGIN_MS)
-    {
-        Some(freshest_wallet.to_string())
-    } else {
-        None
-    }
 }
 
 fn extract_contextual_alias(payload: &[u8]) -> Option<String> {
@@ -2651,7 +2639,7 @@ mod tests {
     }
 
     #[test]
-    fn contextual_matching_allows_single_wallet_alias_when_receiver_does_not_match() {
+    fn contextual_matching_skips_single_wallet_alias_when_receiver_does_not_match() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2680,13 +2668,12 @@ mod tests {
                 )
                 .await;
 
-            assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].device_token, "apns-receiver");
+            assert!(targets.is_empty());
         });
     }
 
     #[test]
-    fn contextual_matching_excludes_sender_for_self_spend_receiver() {
+    fn contextual_matching_skips_self_spend_receiver_without_logical_receiver() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2723,8 +2710,7 @@ mod tests {
                 )
                 .await;
 
-            assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].device_token, "apns-receiver");
+            assert!(targets.is_empty());
         });
     }
 
@@ -2806,39 +2792,35 @@ mod tests {
     }
 
     #[test]
-    fn contextual_matching_scopes_duplicate_alias_to_freshest_wallet() {
+    fn contextual_matching_skips_fcm_target_when_apns_wallet_shares_alias_without_receiver() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
         runtime.block_on(async {
-            let mut fresh = test_registration(
-                "fcm-fresh",
-                "fcm",
-                None,
-                "kaspa:qfresh",
-            );
-            fresh.contextual_routes = vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
-            fresh.updated_at_ms = 10_000_000;
+            let mut android_receiver =
+                test_registration("fcm-receiver", "fcm", None, "kaspa:qandroid");
+            android_receiver.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
+            android_receiver.updated_at_ms = 10_000_000;
 
-            let mut stale = test_registration(
-                "apns-stale",
+            let mut ios_peer = test_registration(
+                "apns-peer",
                 "apns",
                 Some("com.kbeam.app"),
-                "kaspa:qstale",
+                "kaspa:qios",
             );
-            stale.contextual_routes = vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
-            stale.updated_at_ms = fresh
-                .updated_at_ms
-                .saturating_sub(CONTEXTUAL_ALIAS_DUPLICATE_FRESHNESS_MARGIN_MS + 1);
+            ios_peer.contextual_routes =
+                vec![test_contextual_route("kaspa:qsender", "shared-alias__kbp1")];
+            ios_peer.updated_at_ms = android_receiver.updated_at_ms.saturating_sub(120_000);
 
             let mut registrations = HashMap::new();
-            registrations.insert(fresh.device_token.clone(), fresh);
-            registrations.insert(stale.device_token.clone(), stale);
+            registrations.insert(android_receiver.device_token.clone(), android_receiver);
+            registrations.insert(ios_peer.device_token.clone(), ios_peer);
 
             let service = test_service(registrations);
-            let targets = service
+            let fcm_targets = service
                 .matching_registrations(
                     PushMessageType::Contextual,
                     "kaspa:qsender",
@@ -2847,14 +2829,23 @@ mod tests {
                     "fcm",
                 )
                 .await;
+            let apns_targets = service
+                .matching_registrations(
+                    PushMessageType::Contextual,
+                    "kaspa:qsender",
+                    Some("kaspa:qsender"),
+                    Some("shared-alias__kbp1"),
+                    "apns",
+                )
+                .await;
 
-            assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].device_token, "fcm-fresh");
+            assert!(fcm_targets.is_empty());
+            assert!(apns_targets.is_empty());
         });
     }
 
     #[test]
-    fn contextual_matching_allows_same_alias_for_same_wallet_devices() {
+    fn contextual_matching_skips_same_wallet_devices_without_receiver() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2891,7 +2882,7 @@ mod tests {
                 )
                 .await;
 
-            assert_eq!(targets.len(), 2);
+            assert!(targets.is_empty());
         });
     }
 

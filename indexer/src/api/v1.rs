@@ -49,6 +49,7 @@ pub mod self_stash;
         handshakes::get_handshakes_by_sender,
         handshakes::get_handshakes_by_receiver,
         contextual_messages::get_contextual_messages_by_sender,
+        contextual_messages::get_contextual_message_by_txid,
         payments::get_payments_by_sender,
         payments::get_payments_by_receiver,
         gift::create_challenge,

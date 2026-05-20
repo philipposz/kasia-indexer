@@ -43,7 +43,9 @@ impl ContextualMessageApi {
     }
 
     pub fn router() -> Router<Self> {
-        Router::new().route("/by-sender", get(get_contextual_messages_by_sender))
+        Router::new()
+            .route("/by-sender", get(get_contextual_messages_by_sender))
+            .route("/by-txid", get(get_contextual_message_by_txid))
     }
 }
 
@@ -53,6 +55,13 @@ pub struct ContextualMessagePaginationParams {
     pub block_time: Option<u64>,
     pub address: String,
     pub alias: String,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ContextualMessageByTxIdParams {
+    pub tx_id: String,
+    pub sender: Option<String>,
+    pub address: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -194,6 +203,138 @@ async fn get_contextual_messages_by_sender(
                     .collect::<Result<Vec<_>, _>>()
             })
             .flatten()
+    })
+    .await;
+
+    match result {
+        Ok(Ok(messages)) => Ok(Json(messages)),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+        Err(join_err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Task error: {join_err}"),
+            }),
+        )),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/contextual-messages/by-txid",
+    params(ContextualMessageByTxIdParams),
+    responses(
+        (status = 200, description = "Get contextual message by transaction id", body = [ContextualMessageResponse]),
+        (status = 400, description = "Bad request", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
+pub async fn get_contextual_message_by_txid(
+    State(state): State<ContextualMessageApi>,
+    Query(params): Query<ContextualMessageByTxIdParams>,
+) -> impl IntoResponse {
+    let normalized_tx_id = params.tx_id.trim().to_ascii_lowercase();
+    if normalized_tx_id.len() != 64 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Transaction ID must be 64 hex characters".to_string(),
+            }),
+        ));
+    }
+    let mut tx_id = [0u8; 32];
+    if let Err(e) = faster_hex::hex_decode(normalized_tx_id.as_bytes(), &mut tx_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid transaction ID: {e}"),
+            }),
+        ));
+    }
+
+    let sender_filter = params
+        .sender
+        .or(params.address)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let sender_payload = if let Some(sender) = sender_filter {
+        let sender_rpc = match kaspa_rpc_core::RpcAddress::try_from(sender) {
+            Ok(addr) => addr,
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Invalid sender address: {e}"),
+                    }),
+                ));
+            }
+        };
+        match AddressPayload::try_from(&sender_rpc) {
+            Ok(payload) => Some(payload),
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Invalid sender address payload: {e}"),
+                    }),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    let result = spawn_blocking(move || {
+        let rtx = state.tx_keyspace.read_tx();
+        let candidate = if let Some(sender) = sender_payload {
+            state
+                .contextual_message_by_sender_partition
+                .get_by_sender_prefix(&rtx, &sender)
+                .process_results(|mut iter| iter.find(|message| message.tx_id == tx_id))?
+        } else {
+            state
+                .contextual_message_by_sender_partition
+                .get_all(&rtx)
+                .process_results(|mut iter| iter.find(|message| message.tx_id == tx_id))?
+        };
+        let Some(message_key) = candidate else {
+            return Ok(Vec::<ContextualMessageResponse>::new());
+        };
+        let sender_str = match to_rpc_address(&message_key.sender, state.context.network_type) {
+            Ok(Some(addr)) => addr.to_string(),
+            Ok(None) => String::new(),
+            Err(e) => bail!("Address conversion error: {}", e),
+        };
+        let acceptance = state
+            .tx_id_to_acceptance_partition
+            .acceptance_by_tx_id_rtx(&rtx, &message_key.tx_id)?;
+        let (accepting_block, accepting_daa_score) = if let Some(acceptance) = acceptance {
+            (
+                Some(faster_hex::hex_string(
+                    &acceptance.header.accepting_block_hash,
+                )),
+                Some(acceptance.header.accepting_daa.into()),
+            )
+        } else {
+            (None, None)
+        };
+        let sealed_hex = state
+            .tx_id_to_contextual_message_partition
+            .get_rtx(&rtx, &message_key.tx_id)?
+            .expect("Message not found");
+        Ok(vec![ContextualMessageResponse {
+            tx_id: faster_hex::hex_string(&message_key.tx_id),
+            sender: sender_str,
+            alias: faster_hex::hex_string(&message_key.alias),
+            block_time: message_key.block_time.into(),
+            accepting_block,
+            accepting_daa_score,
+            message_payload: faster_hex::hex_string(sealed_hex.as_ref()),
+        }])
     })
     .await;
 

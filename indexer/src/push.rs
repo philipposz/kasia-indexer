@@ -840,15 +840,24 @@ impl PushService {
                 if !contact_request_registrations.is_empty() {
                     contact_request_registrations
                 } else if !non_sender_registrations.is_empty() {
-                    self.metrics
-                        .increment_contextual_push_skipped_ambiguous_receiver(token_type);
-                    warn!(
-                        alias = %alias,
-                        sender = %sender_address,
-                        token_type,
-                        "Skipping contextual push dispatch because alias matched but receiver wallet was not unique"
-                    );
-                    return Vec::new();
+                    let matching_wallets = non_sender_registrations
+                        .iter()
+                        .map(|registration| registration.wallet_address.as_str())
+                        .collect::<HashSet<_>>();
+                    if matching_wallets.len() == 1 {
+                        non_sender_registrations
+                    } else {
+                        self.metrics
+                            .increment_contextual_push_skipped_ambiguous_receiver(token_type);
+                        warn!(
+                            alias = %alias,
+                            sender = %sender_address,
+                            token_type,
+                            wallet_count = matching_wallets.len(),
+                            "Skipping contextual push dispatch because alias matched but receiver wallet was not unique"
+                        );
+                        return Vec::new();
+                    }
                 } else {
                     debug!(
                         alias = %alias,
@@ -2678,7 +2687,7 @@ mod tests {
     }
 
     #[test]
-    fn contextual_matching_skips_single_wallet_alias_when_receiver_does_not_match() {
+    fn contextual_matching_allows_single_wallet_alias_when_receiver_is_unhelpful() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2708,7 +2717,8 @@ mod tests {
                 )
                 .await;
 
-            assert!(targets.is_empty());
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].device_token, "apns-receiver");
         });
     }
 
@@ -2896,7 +2906,7 @@ mod tests {
     }
 
     #[test]
-    fn contextual_matching_skips_same_wallet_devices_without_receiver() {
+    fn contextual_matching_allows_same_wallet_devices_without_receiver() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2931,7 +2941,13 @@ mod tests {
                 )
                 .await;
 
-            assert!(targets.is_empty());
+            assert_eq!(targets.len(), 2);
+            let tokens = targets
+                .iter()
+                .map(|registration| registration.device_token.as_str())
+                .collect::<HashSet<_>>();
+            assert!(tokens.contains("apns-first"));
+            assert!(tokens.contains("apns-second"));
         });
     }
 

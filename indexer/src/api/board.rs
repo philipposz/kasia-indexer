@@ -1567,23 +1567,8 @@ fn build_pulse_reply_push_event(
         actor_address: reply_author_address.to_string(),
         actor_display_name: reply_post.author.display_name.clone(),
         actor_avatar_url: reply_post.author.avatar_url.clone(),
-        preview_text: pulse_reply_preview_text(reply_post),
         timestamp: parse_timestamp_ms(&reply_post.created_at).unwrap_or_default(),
     })
-}
-
-fn pulse_reply_preview_text(reply_post: &BoardPostResponse) -> Option<String> {
-    let content_text = reply_post.content_text.trim();
-    if !content_text.is_empty() {
-        return Some(content_text.to_string());
-    }
-    if !reply_post.attachments.is_empty() {
-        return Some("Attachment".to_string());
-    }
-    if reply_post.primary_link_url.is_some() {
-        return Some("Link".to_string());
-    }
-    None
 }
 
 fn ensure_post_exists(

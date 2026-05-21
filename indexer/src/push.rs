@@ -351,7 +351,6 @@ pub struct PulseReplyPushEvent {
     pub actor_address: String,
     pub actor_display_name: String,
     pub actor_avatar_url: Option<String>,
-    pub preview_text: Option<String>,
     pub timestamp: u64,
 }
 
@@ -563,14 +562,7 @@ impl PushService {
             json!({
                 "alert": {
                     "title": "KBeam",
-                    "body": match event.message_type {
-                        PushMessageType::Payment => "Received payment",
-                        PushMessageType::Handshake => "Started a conversation",
-                        // Contextual payload text is rendered by the iOS notification service extension.
-                        // Keep backend fallback neutral to avoid leaking control-payload noise if extension processing fails.
-                        PushMessageType::Contextual => " ",
-                        PushMessageType::PulseReply => "New Pulse reply",
-                    }
+                    "body": "Neue KBeam-Nachricht"
                 },
                 "mutable-content": 1,
                 "content-available": 1
@@ -580,9 +572,6 @@ impl PushService {
         body.insert("sender".to_string(), json!(sender_address));
         body.insert("type".to_string(), json!(message_type_tag));
         body.insert("timestamp".to_string(), json!(event.timestamp));
-        if let Some(amount) = event.amount {
-            body.insert("amount".to_string(), json!(amount));
-        }
         if let Some(payload) = payload_hex.as_deref() {
             body.insert("payload".to_string(), json!(payload));
         }
@@ -593,9 +582,6 @@ impl PushService {
         data.insert("sender".to_string(), sender_address.clone());
         data.insert("type".to_string(), message_type_tag.to_string());
         data.insert("timestamp".to_string(), event.timestamp.to_string());
-        if let Some(amount) = event.amount {
-            data.insert("amount".to_string(), amount.to_string());
-        }
         if let Some(payload) = payload_hex {
             data.insert("payload".to_string(), payload);
         }
@@ -1401,13 +1387,6 @@ impl PushService {
         } else {
             actor_display_name.to_string()
         };
-        let fallback_body = format!("{actor_display_name} replied to your Pulse");
-        let preview_text = event
-            .preview_text
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| truncate_for_push(value, 180));
         let actor_avatar_url = event
             .actor_avatar_url
             .as_deref()
@@ -1416,8 +1395,8 @@ impl PushService {
         let payload = json!({
             "aps": {
                 "alert": {
-                    "title": actor_display_name,
-                    "body": fallback_body
+                    "title": "KBeam",
+                    "body": "Neue KBeam-Nachricht"
                 },
                 "mutable-content": 1,
                 "content-available": 1
@@ -1427,7 +1406,6 @@ impl PushService {
             "sender": actor_address,
             "post_id": event.post_id,
             "actor_avatar_url": actor_avatar_url,
-            "preview_text": preview_text,
             "timestamp": event.timestamp,
         });
 
@@ -1437,13 +1415,9 @@ impl PushService {
         data.insert("sender".to_string(), actor_address.clone());
         data.insert("post_id".to_string(), event.post_id.clone());
         data.insert("actor_display_name".to_string(), actor_display_name.clone());
-        data.insert("body".to_string(), fallback_body);
         data.insert("timestamp".to_string(), event.timestamp.to_string());
         if let Some(actor_avatar_url) = actor_avatar_url {
             data.insert("actor_avatar_url".to_string(), actor_avatar_url.to_string());
-        }
-        if let Some(preview_text) = preview_text {
-            data.insert("preview_text".to_string(), preview_text);
         }
 
         let mut stale_tokens = Vec::new();
@@ -2096,17 +2070,6 @@ fn push_message_type_tag(message_type: PushMessageType) -> &'static str {
         PushMessageType::Payment => "payment",
         PushMessageType::Contextual => "contextual",
         PushMessageType::PulseReply => "pulse_reply",
-    }
-}
-
-fn truncate_for_push(value: &str, max_chars: usize) -> String {
-    let trimmed = value.trim();
-    let mut iter = trimmed.chars();
-    let truncated: String = iter.by_ref().take(max_chars).collect();
-    if iter.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
     }
 }
 

@@ -57,6 +57,7 @@ pub struct PushConfig {
     pub push_provider: String,
     pub push_ios_enabled: bool,
     pub push_fcm_enabled: bool,
+    pub push_apns_presence_enabled: bool,
     pub challenge_ttl_ms: u64,
     pub challenge_skew_ms: u64,
     pub apns_environment: String,
@@ -77,6 +78,7 @@ impl PushConfig {
             push_provider: read_env_string("PUSH_PROVIDER").unwrap_or_else(|| "apns".to_string()),
             push_ios_enabled: read_env_bool("PUSH_IOS_ENABLED", true),
             push_fcm_enabled: read_env_bool("PUSH_FCM_ENABLED", false),
+            push_apns_presence_enabled: read_env_bool("PUSH_APNS_PRESENCE_ENABLED", false),
             challenge_ttl_ms: read_env_u64("PUSH_CHALLENGE_TTL_MS", 120_000),
             challenge_skew_ms: read_env_u64("PUSH_CHALLENGE_SKEW_MS", 15_000),
             apns_environment: read_env_string("PUSH_APNS_ENVIRONMENT")
@@ -1067,46 +1069,48 @@ impl PushService {
         data.insert("timestamp".to_string(), request.timestamp_ms.to_string());
 
         let mut stale_tokens = Vec::new();
-        if let Some(apns_client) = &self.apns_client {
-            let apns_targets = self
-                .registrations_for_wallet(recipient_address.as_str(), "apns")
-                .await;
-            self.dispatch_counters
-                .targets
-                .fetch_add(apns_targets.len() as u64, Ordering::Relaxed);
-
-            for registration in apns_targets {
+        if self.config.push_apns_presence_enabled {
+            if let Some(apns_client) = &self.apns_client {
+                let apns_targets = self
+                    .registrations_for_wallet(recipient_address.as_str(), "apns")
+                    .await;
                 self.dispatch_counters
-                    .attempts
-                    .fetch_add(1, Ordering::Relaxed);
-                match apns_client
-                    .send_notification(
-                        &registration.device_token,
-                        &payload,
-                        PushMessageType::Contextual,
-                    )
-                    .await
-                {
-                    Ok(ApnsSendOutcome::Sent) => {
-                        self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Ok(ApnsSendOutcome::InvalidToken) => {
-                        self.dispatch_counters
-                            .invalid
-                            .fetch_add(1, Ordering::Relaxed);
-                        stale_tokens.push(registration.device_token);
-                    }
-                    Err(error) => {
-                        self.dispatch_counters
-                            .failed
-                            .fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            %error,
-                            token = %registration.device_token,
-                            recipient = %recipient_address,
-                            presence_type = %event_type,
-                            "APNs presence delivery failed"
-                        );
+                    .targets
+                    .fetch_add(apns_targets.len() as u64, Ordering::Relaxed);
+
+                for registration in apns_targets {
+                    self.dispatch_counters
+                        .attempts
+                        .fetch_add(1, Ordering::Relaxed);
+                    match apns_client
+                        .send_notification(
+                            &registration.device_token,
+                            &payload,
+                            PushMessageType::Contextual,
+                        )
+                        .await
+                    {
+                        Ok(ApnsSendOutcome::Sent) => {
+                            self.dispatch_counters.sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(ApnsSendOutcome::InvalidToken) => {
+                            self.dispatch_counters
+                                .invalid
+                                .fetch_add(1, Ordering::Relaxed);
+                            stale_tokens.push(registration.device_token);
+                        }
+                        Err(error) => {
+                            self.dispatch_counters
+                                .failed
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(
+                                %error,
+                                token = %registration.device_token,
+                                recipient = %recipient_address,
+                                presence_type = %event_type,
+                                "APNs presence delivery failed"
+                            );
+                        }
                     }
                 }
             }

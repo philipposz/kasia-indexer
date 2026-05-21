@@ -2153,10 +2153,14 @@ fn normalize_contextual_routes(
             .and_then(normalize_address)
             .filter(|value| value == &authenticated_receiver)
             .unwrap_or_else(|| authenticated_receiver.clone());
-        let entry = route_aliases
-            .entry((peer_address, receiver_address))
-            .or_default();
-        for alias in normalize_aliases(value.aliases) {
+        for alias in normalize_contextual_route_aliases(
+            &peer_address,
+            &receiver_address,
+            normalize_aliases(value.aliases),
+        ) {
+            let entry = route_aliases
+                .entry((peer_address.clone(), receiver_address.clone()))
+                .or_default();
             if !entry.contains(&alias) {
                 entry.push(alias);
             }
@@ -2204,6 +2208,110 @@ fn derived_contextual_registration_aliases(
         }
     }
     aliases
+}
+
+fn normalize_contextual_route_aliases(
+    sender_wallet: &str,
+    receiver_wallet: &str,
+    aliases: Vec<String>,
+) -> Vec<String> {
+    let reusable_base_aliases = aliases
+        .iter()
+        .filter(|alias| !is_route_scoped_alias(alias))
+        .cloned()
+        .collect::<Vec<_>>();
+    let allowed_route_aliases = route_scoped_watch_aliases(
+        sender_wallet,
+        receiver_wallet,
+        reusable_base_aliases.iter().map(String::as_str),
+    )
+    .into_iter()
+    .collect::<HashSet<_>>();
+
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for alias in aliases {
+        if is_route_scoped_alias(&alias) && !allowed_route_aliases.contains(&alias) {
+            continue;
+        }
+        if seen.insert(alias.clone()) {
+            normalized.push(alias);
+        }
+    }
+    for alias in allowed_route_aliases {
+        if seen.insert(alias.clone()) {
+            normalized.push(alias);
+        }
+    }
+    normalized
+}
+
+fn route_scoped_watch_aliases<'a>(
+    sender_wallet: &str,
+    receiver_wallet: &str,
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut values = Vec::new();
+    for alias in aliases {
+        if let Some(base) = route_scoped_base_alias(sender_wallet, receiver_wallet, alias) {
+            for value in push_watch_aliases(&base) {
+                if seen.insert(value.clone()) {
+                    values.push(value);
+                }
+            }
+        }
+    }
+    values
+}
+
+fn route_scoped_base_alias(
+    sender_wallet: &str,
+    receiver_wallet: &str,
+    alias: &str,
+) -> Option<String> {
+    let sender = sender_wallet.trim().to_lowercase();
+    let receiver = receiver_wallet.trim().to_lowercase();
+    let base = base_alias(alias).trim().to_lowercase();
+    if sender.is_empty() || receiver.is_empty() || base.is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(format!(
+        "kbeam-route-alias-v1\n{sender}\n{receiver}\n{base}"
+    ));
+    Some(format!("kbr1_{}", faster_hex::hex_string(&digest[..16])))
+}
+
+fn is_route_scoped_alias(alias: &str) -> bool {
+    let base = base_alias(alias).trim().to_lowercase();
+    let Some(digest) = base.strip_prefix("kbr1_") else {
+        return false;
+    };
+    digest.len() == 32 && digest.chars().all(|value| value.is_ascii_hexdigit())
+}
+
+fn push_watch_aliases(base: &str) -> Vec<String> {
+    vec![
+        base.to_string(),
+        format!("{base}{PUSH_SUPPRESSED_ALIAS_SUFFIX}"),
+        format!("{base}{PUSH_VISIBLE_ALIAS_SUFFIX}"),
+        format!("{base}{LEGACY_PUSH_SUPPRESSED_ALIAS_SUFFIX}"),
+        format!("{base}{LEGACY_PUSH_VISIBLE_ALIAS_SUFFIX}"),
+    ]
+}
+
+fn base_alias(alias: &str) -> String {
+    let normalized = alias.trim();
+    [
+        PUSH_SUPPRESSED_ALIAS_SUFFIX,
+        PUSH_VISIBLE_ALIAS_SUFFIX,
+        LEGACY_PUSH_SUPPRESSED_ALIAS_SUFFIX,
+        LEGACY_PUSH_VISIBLE_ALIAS_SUFFIX,
+    ]
+    .iter()
+    .find_map(|suffix| normalized.strip_suffix(suffix))
+    .unwrap_or(normalized)
+    .to_string()
 }
 
 fn registration_allows_contextual_alias(
@@ -2953,6 +3061,39 @@ mod tests {
             assert!(tokens.contains("apns-first"));
             assert!(tokens.contains("apns-second"));
         });
+    }
+
+    #[test]
+    fn contextual_route_normalization_filters_reflected_route_scoped_aliases() {
+        let sender = "kaspa:qsender";
+        let receiver = "kaspa:qreceiver";
+        let good_alias = route_scoped_base_alias(sender, receiver, "base-alias").unwrap();
+        let bad_alias = route_scoped_base_alias("kaspa:qother", receiver, "base-alias").unwrap();
+
+        let routes = normalize_contextual_routes(
+            receiver,
+            vec![ContextualPushRoute {
+                peer_address: sender.to_string(),
+                receiver_address: Some(receiver.to_string()),
+                aliases: vec![
+                    "base-alias".to_string(),
+                    format!("{bad_alias}{PUSH_VISIBLE_ALIAS_SUFFIX}"),
+                ],
+            }],
+        );
+
+        assert_eq!(routes.len(), 1);
+        assert!(routes[0].aliases.contains(&"base-alias".to_string()));
+        assert!(
+            routes[0]
+                .aliases
+                .contains(&format!("{good_alias}{PUSH_VISIBLE_ALIAS_SUFFIX}"))
+        );
+        assert!(
+            !routes[0]
+                .aliases
+                .contains(&format!("{bad_alias}{PUSH_VISIBLE_ALIAS_SUFFIX}"))
+        );
     }
 
     #[test]

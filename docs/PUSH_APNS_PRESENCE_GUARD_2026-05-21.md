@@ -6,7 +6,7 @@ Live-Logs on 2026-05-21 showed APNs dispatches every 30 seconds while an Android
 
 ## Change
 
-`PUSH_APNS_PRESENCE_ENABLED` now defaults to `false`. The server still accepts presence events and continues to deliver them to FCM, but APNs presence dispatch is skipped unless this flag is explicitly enabled after the iOS client has a verified silent-presence path.
+`PUSH_APNS_PRESENCE_ENABLED` was introduced as an explicit guard. It can still disable APNs presence dispatch, but the verified default is now `true` so Android-to-iOS typing/activity reaches the iOS silent-presence path. The server still accepts presence events and continues to deliver them to FCM.
 
 Contextual message, payment, handshake, Pulse, and FCM push routing are unchanged.
 

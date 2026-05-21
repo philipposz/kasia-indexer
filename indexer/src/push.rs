@@ -78,7 +78,7 @@ impl PushConfig {
             push_provider: read_env_string("PUSH_PROVIDER").unwrap_or_else(|| "apns".to_string()),
             push_ios_enabled: read_env_bool("PUSH_IOS_ENABLED", true),
             push_fcm_enabled: read_env_bool("PUSH_FCM_ENABLED", false),
-            push_apns_presence_enabled: read_env_bool("PUSH_APNS_PRESENCE_ENABLED", false),
+            push_apns_presence_enabled: read_env_bool("PUSH_APNS_PRESENCE_ENABLED", true),
             challenge_ttl_ms: read_env_u64("PUSH_CHALLENGE_TTL_MS", 120_000),
             challenge_skew_ms: read_env_u64("PUSH_CHALLENGE_SKEW_MS", 15_000),
             apns_environment: read_env_string("PUSH_APNS_ENVIRONMENT")
@@ -3129,6 +3129,7 @@ mod tests {
                 push_provider: "apns".to_string(),
                 push_ios_enabled: true,
                 push_fcm_enabled: true,
+                push_apns_presence_enabled: true,
                 challenge_ttl_ms: 120_000,
                 challenge_skew_ms: 15_000,
                 apns_environment: "auto".to_string(),

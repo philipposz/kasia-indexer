@@ -4,12 +4,14 @@
 
 Android-zu-iOS-Typing wurde serverseitig nicht bis APNs weitergereicht, obwohl der
 Presence-Endpunkt die Events annimmt und FCM-Ziele beliefert. Ursache ist der
-APNs-Presence-Guard: `PUSH_APNS_PRESENCE_ENABLED` defaultet im Code auf `false`
-und war in der Beispielkonfiguration ebenfalls deaktiviert.
+APNs-Presence-Guard: `PUSH_APNS_PRESENCE_ENABLED` war nicht durchgaengig im
+laufenden Compose-/Code-Default aktiviert. Dadurch konnte der Dienst ohne echte
+Server-Env wieder auf `false` fallen.
 
 ## Änderung
 
-`PUSH_APNS_PRESENCE_ENABLED=true` aktiviert den silent APNs-Presence-Pfad wieder.
+`PUSH_APNS_PRESENCE_ENABLED=true` ist jetzt Code- und Compose-Default und
+aktiviert den silent APNs-Presence-Pfad wieder.
 Der Payload bleibt still und enthält nur `content-available`, `type`, `sender`
 und `timestamp`; sichtbare Benachrichtigungen werden dadurch nicht erzeugt.
 

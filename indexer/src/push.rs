@@ -2545,7 +2545,13 @@ async fn load_registrations(path: &Path) -> anyhow::Result<HashMap<String, Devic
     Ok(snapshot
         .registrations
         .into_iter()
-        .map(|registration| (registration.device_token.clone(), registration))
+        .map(|mut registration| {
+            registration.contextual_routes = normalize_contextual_routes(
+                &registration.wallet_address,
+                registration.contextual_routes,
+            );
+            (registration.device_token.clone(), registration)
+        })
         .collect())
 }
 

@@ -6,7 +6,7 @@ Live push registrations contained route-scoped `kbr1_...` aliases on the wrong r
 
 ## Fix
 
-The indexer now normalizes contextual routes before storing them. Reusable base aliases are kept, valid route-scoped aliases are derived from `(sender_wallet, receiver_wallet, alias)`, and reflected route-scoped aliases that do not match the registered route are dropped.
+The indexer now normalizes contextual routes before storing and after loading them. Reusable base aliases are kept, valid route-scoped aliases are derived from `(sender_wallet, receiver_wallet, alias)`, and reflected route-scoped aliases that do not match the registered route are dropped.
 
 ## Verification
 

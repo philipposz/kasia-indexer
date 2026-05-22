@@ -108,6 +108,9 @@ struct PushDispatchCounters {
     invalid: AtomicU64,
     failed: AtomicU64,
     deduped: AtomicU64,
+    payload_inline: AtomicU64,
+    payload_missing: AtomicU64,
+    payload_bytes_total: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -119,6 +122,9 @@ struct PushDispatchSnapshot {
     invalid: u64,
     failed: u64,
     deduped: u64,
+    payload_inline: u64,
+    payload_missing: u64,
+    payload_bytes_total: u64,
 }
 
 impl PushDispatchCounters {
@@ -131,6 +137,9 @@ impl PushDispatchCounters {
             invalid: self.invalid.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             deduped: self.deduped.load(Ordering::Relaxed),
+            payload_inline: self.payload_inline.load(Ordering::Relaxed),
+            payload_missing: self.payload_missing.load(Ordering::Relaxed),
+            payload_bytes_total: self.payload_bytes_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -145,6 +154,13 @@ impl PushDispatchSnapshot {
             invalid: self.invalid.saturating_sub(previous.invalid),
             failed: self.failed.saturating_sub(previous.failed),
             deduped: self.deduped.saturating_sub(previous.deduped),
+            payload_inline: self.payload_inline.saturating_sub(previous.payload_inline),
+            payload_missing: self
+                .payload_missing
+                .saturating_sub(previous.payload_missing),
+            payload_bytes_total: self
+                .payload_bytes_total
+                .saturating_sub(previous.payload_bytes_total),
         }
     }
 
@@ -156,6 +172,9 @@ impl PushDispatchSnapshot {
             || self.invalid > 0
             || self.failed > 0
             || self.deduped > 0
+            || self.payload_inline > 0
+            || self.payload_missing > 0
+            || self.payload_bytes_total > 0
     }
 }
 
@@ -457,7 +476,13 @@ impl PushService {
             invalid_total = current.invalid,
             failed_total = current.failed,
             deduped_total = current.deduped,
-            "APNs monitor"
+            payload_inline_delta = delta.payload_inline,
+            payload_missing_delta = delta.payload_missing,
+            payload_bytes_delta = delta.payload_bytes_total,
+            payload_inline_total = current.payload_inline,
+            payload_missing_total = current.payload_missing,
+            payload_bytes_total = current.payload_bytes_total,
+            "Push dispatch monitor"
         );
 
         *previous_snapshot = current;
@@ -554,6 +579,23 @@ impl PushService {
             .as_ref()
             .map(|payload| faster_hex::hex_string(payload))
             .filter(|payload| payload.len() <= self.config.apns_inline_payload_limit);
+        let payload_inline = payload_hex.is_some();
+        let payload_len = payload_hex
+            .as_ref()
+            .map(|payload| payload.len() / 2)
+            .unwrap_or(0);
+        if payload_inline {
+            self.dispatch_counters
+                .payload_inline
+                .fetch_add(1, Ordering::Relaxed);
+            self.dispatch_counters
+                .payload_bytes_total
+                .fetch_add(payload_len as u64, Ordering::Relaxed);
+        } else {
+            self.dispatch_counters
+                .payload_missing
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let message_type_tag = push_message_type_tag(event.message_type);
 
         let mut body = serde_json::Map::new();
@@ -582,7 +624,7 @@ impl PushService {
         data.insert("sender".to_string(), sender_address.clone());
         data.insert("type".to_string(), message_type_tag.to_string());
         data.insert("timestamp".to_string(), event.timestamp.to_string());
-        if let Some(payload) = payload_hex {
+        if let Some(payload) = payload_hex.clone() {
             data.insert("payload".to_string(), payload);
         }
 
@@ -600,6 +642,17 @@ impl PushService {
             self.dispatch_counters
                 .targets
                 .fetch_add(apns_targets.len() as u64, Ordering::Relaxed);
+            info!(
+                provider = "apns",
+                tx_id = %tx_id,
+                message_type = %message_type_tag,
+                target_count = apns_targets.len(),
+                payload_inline,
+                payload_len,
+                alias = %contextual_alias.as_deref().unwrap_or_default(),
+                receiver = %receiver_address.as_deref().unwrap_or_default(),
+                "Push targets resolved"
+            );
 
             for registration in apns_targets {
                 if self
@@ -609,9 +662,11 @@ impl PushService {
                     self.dispatch_counters
                         .deduped
                         .fetch_add(1, Ordering::Relaxed);
-                    debug!(
-                        token = %registration.device_token,
+                    info!(
+                        provider = "apns",
                         tx_id = %tx_id,
+                        message_type = %message_type_tag,
+                        payload_inline,
                         "Skipping duplicate push dispatch"
                     );
                     continue;
@@ -633,10 +688,13 @@ impl PushService {
                             event.message_type,
                         )
                         .await;
-                        debug!(
-                            token = %registration.device_token,
+                        info!(
+                            provider = "apns",
                             tx_id = %tx_id,
-                            "APNs notification sent"
+                            message_type = %message_type_tag,
+                            payload_inline,
+                            payload_len,
+                            "Push notification sent"
                         );
                     }
                     Ok(ApnsSendOutcome::InvalidToken) => {
@@ -674,6 +732,17 @@ impl PushService {
             self.dispatch_counters
                 .targets
                 .fetch_add(fcm_targets.len() as u64, Ordering::Relaxed);
+            info!(
+                provider = "fcm",
+                tx_id = %tx_id,
+                message_type = %message_type_tag,
+                target_count = fcm_targets.len(),
+                payload_inline,
+                payload_len,
+                alias = %contextual_alias.as_deref().unwrap_or_default(),
+                receiver = %receiver_address.as_deref().unwrap_or_default(),
+                "Push targets resolved"
+            );
 
             for registration in fcm_targets {
                 if self
@@ -683,9 +752,11 @@ impl PushService {
                     self.dispatch_counters
                         .deduped
                         .fetch_add(1, Ordering::Relaxed);
-                    debug!(
-                        token = %registration.device_token,
+                    info!(
+                        provider = "fcm",
                         tx_id = %tx_id,
+                        message_type = %message_type_tag,
+                        payload_inline,
                         "Skipping duplicate push dispatch"
                     );
                     continue;
@@ -707,10 +778,13 @@ impl PushService {
                             event.message_type,
                         )
                         .await;
-                        debug!(
-                            token = %registration.device_token,
+                        info!(
+                            provider = "fcm",
                             tx_id = %tx_id,
-                            "FCM notification sent"
+                            message_type = %message_type_tag,
+                            payload_inline,
+                            payload_len,
+                            "Push notification sent"
                         );
                     }
                     Ok(FcmSendOutcome::InvalidToken) => {

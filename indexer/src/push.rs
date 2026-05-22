@@ -510,6 +510,7 @@ impl PushService {
         } else {
             None
         };
+        let mut contextual_control_push = false;
 
         if matches!(event.message_type, PushMessageType::Contextual)
             && contextual_alias.as_deref().is_none()
@@ -548,9 +549,9 @@ impl PushService {
                         tx_id = %faster_hex::hex_string(&event.tx_id),
                         sender = %sender_address,
                         alias = %contextual_alias.as_deref().unwrap_or_default(),
-                        "Skipping push dispatch for push-suppressed contextual alias"
+                        "Dispatching silent contextual alias as encrypted control push"
                     );
-                    return Ok(());
+                    contextual_control_push = true;
                 }
                 ContextualAliasPolicy::Visible => {}
                 ContextualAliasPolicy::Unknown => {
@@ -596,11 +597,18 @@ impl PushService {
                 .payload_missing
                 .fetch_add(1, Ordering::Relaxed);
         }
-        let message_type_tag = push_message_type_tag(event.message_type);
+        let message_type_tag = if contextual_control_push {
+            "contextual_control"
+        } else {
+            push_message_type_tag(event.message_type)
+        };
 
         let mut body = serde_json::Map::new();
-        body.insert(
-            "aps".to_string(),
+        let aps = if contextual_control_push {
+            json!({
+                "content-available": 1
+            })
+        } else {
             json!({
                 "alert": {
                     "title": "KBeam",
@@ -608,8 +616,9 @@ impl PushService {
                 },
                 "mutable-content": 1,
                 "content-available": 1
-            }),
-        );
+            })
+        };
+        body.insert("aps".to_string(), aps);
         body.insert("tx_id".to_string(), json!(tx_id));
         body.insert("sender".to_string(), json!(sender_address));
         body.insert("type".to_string(), json!(message_type_tag));
@@ -656,7 +665,7 @@ impl PushService {
 
             for registration in apns_targets {
                 if self
-                    .was_recently_dispatched(&registration.device_token, &tx_id, event.message_type)
+                    .was_recently_dispatched(&registration.device_token, &tx_id, message_type_tag)
                     .await
                 {
                     self.dispatch_counters
@@ -685,7 +694,7 @@ impl PushService {
                         self.mark_recent_dispatch(
                             &registration.device_token,
                             &tx_id,
-                            event.message_type,
+                            message_type_tag,
                         )
                         .await;
                         info!(
@@ -746,7 +755,7 @@ impl PushService {
 
             for registration in fcm_targets {
                 if self
-                    .was_recently_dispatched(&registration.device_token, &tx_id, event.message_type)
+                    .was_recently_dispatched(&registration.device_token, &tx_id, message_type_tag)
                     .await
                 {
                     self.dispatch_counters
@@ -775,7 +784,7 @@ impl PushService {
                         self.mark_recent_dispatch(
                             &registration.device_token,
                             &tx_id,
-                            event.message_type,
+                            message_type_tag,
                         )
                         .await;
                         info!(
@@ -820,36 +829,27 @@ impl PushService {
         &self,
         device_token: &str,
         tx_id: &str,
-        message_type: PushMessageType,
+        message_type_tag: &str,
     ) -> bool {
         let now = now_ms();
         let cutoff = now.saturating_sub(self.dispatch_dedupe_ttl_ms);
         let mut recent = self.recent_dispatches.lock().await;
         recent.retain(|_, ts| *ts >= cutoff);
-        let key = Self::dispatch_dedupe_key(device_token, tx_id, message_type);
+        let key = Self::dispatch_dedupe_key(device_token, tx_id, message_type_tag);
         recent.contains_key(&key)
     }
 
-    async fn mark_recent_dispatch(
-        &self,
-        device_token: &str,
-        tx_id: &str,
-        message_type: PushMessageType,
-    ) {
+    async fn mark_recent_dispatch(&self, device_token: &str, tx_id: &str, message_type_tag: &str) {
         let now = now_ms();
         let cutoff = now.saturating_sub(self.dispatch_dedupe_ttl_ms);
         let mut recent = self.recent_dispatches.lock().await;
         recent.retain(|_, ts| *ts >= cutoff);
-        let key = Self::dispatch_dedupe_key(device_token, tx_id, message_type);
+        let key = Self::dispatch_dedupe_key(device_token, tx_id, message_type_tag);
         recent.insert(key, now);
     }
 
-    fn dispatch_dedupe_key(
-        device_token: &str,
-        tx_id: &str,
-        _message_type: PushMessageType,
-    ) -> String {
-        format!("{device_token}:{tx_id}")
+    fn dispatch_dedupe_key(device_token: &str, tx_id: &str, message_type_tag: &str) -> String {
+        format!("{device_token}:{message_type_tag}:{tx_id}")
     }
 
     async fn matching_registrations(
@@ -1514,7 +1514,7 @@ impl PushService {
                     .was_recently_dispatched(
                         &registration.device_token,
                         event.reply_id.as_str(),
-                        PushMessageType::PulseReply,
+                        push_message_type_tag(PushMessageType::PulseReply),
                     )
                     .await
                 {
@@ -1540,7 +1540,7 @@ impl PushService {
                         self.mark_recent_dispatch(
                             &registration.device_token,
                             event.reply_id.as_str(),
-                            PushMessageType::PulseReply,
+                            push_message_type_tag(PushMessageType::PulseReply),
                         )
                         .await;
                     }
@@ -1585,7 +1585,7 @@ impl PushService {
                     .was_recently_dispatched(
                         &registration.device_token,
                         event.reply_id.as_str(),
-                        PushMessageType::PulseReply,
+                        push_message_type_tag(PushMessageType::PulseReply),
                     )
                     .await
                 {
@@ -1607,7 +1607,7 @@ impl PushService {
                         self.mark_recent_dispatch(
                             &registration.device_token,
                             event.reply_id.as_str(),
-                            PushMessageType::PulseReply,
+                            push_message_type_tag(PushMessageType::PulseReply),
                         )
                         .await;
                     }

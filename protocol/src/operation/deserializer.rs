@@ -99,8 +99,13 @@ pub fn parse_sealed_operation(payload_bytes: &[u8]) -> Option<SealedOperation<'_
             }
         }
         Some(msg_type_and_content) => {
-            let msg_type_and_content = faster_hex::hex_string(msg_type_and_content);
-            warn!("Unknown operation type: {msg_type_and_content}");
+            let preview_len = msg_type_and_content.len().min(64);
+            let msg_type_preview = faster_hex::hex_string(&msg_type_and_content[..preview_len]);
+            warn!(
+                payload_len = msg_type_and_content.len(),
+                preview_hex = %msg_type_preview,
+                "Unknown operation type"
+            );
             None
         }
     }
